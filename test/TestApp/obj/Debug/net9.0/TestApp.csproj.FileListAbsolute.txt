@@ -1,0 +1,14 @@
+/Users/rlrd/dev/rust_gc/test/TestApp/bin/Debug/net9.0/TestApp
+/Users/rlrd/dev/rust_gc/test/TestApp/bin/Debug/net9.0/TestApp.deps.json
+/Users/rlrd/dev/rust_gc/test/TestApp/bin/Debug/net9.0/TestApp.runtimeconfig.json
+/Users/rlrd/dev/rust_gc/test/TestApp/bin/Debug/net9.0/TestApp.dll
+/Users/rlrd/dev/rust_gc/test/TestApp/bin/Debug/net9.0/TestApp.pdb
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.GeneratedMSBuildEditorConfig.editorconfig
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.AssemblyInfoInputs.cache
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.AssemblyInfo.cs
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.csproj.CoreCompileInputs.cache
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.dll
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/refint/TestApp.dll
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.pdb
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/TestApp.genruntimeconfig.cache
+/Users/rlrd/dev/rust_gc/test/TestApp/obj/Debug/net9.0/ref/TestApp.dll
