@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 
 namespace TestApp
@@ -61,7 +61,7 @@ namespace TestApp
             // Test 2: Force a garbage collection
             Console.WriteLine("Test 2: Forcing a full garbage collection...");
             GC.Collect();
-            
+
             var stats3 = CollectMemoryStats();
             PrintMemoryStats("After garbage collection", stats3);
 
@@ -79,12 +79,12 @@ namespace TestApp
             // Test 4: Test GC handles
             Console.WriteLine("Test 4: Testing GC handles...");
             var obj = new object();
-            
+
             // Create different types of handles
             var strongHandle = GCHandle.Alloc(obj, GCHandleType.Normal);
             var weakHandle = GCHandle.Alloc(obj, GCHandleType.Weak);
             var pinnedHandle = GCHandle.Alloc(obj, GCHandleType.Pinned);
-            
+
             Console.WriteLine($"Created Strong Handle: {strongHandle}");
             Console.WriteLine($"Created Weak Handle: {weakHandle}");
             Console.WriteLine($"Created Pinned Handle: {pinnedHandle}");
@@ -95,9 +95,9 @@ namespace TestApp
             strongHandle.Free();
             weakHandle.Free();
             pinnedHandle.Free();
-            
+
             GC.Collect();
-            
+
             var stats5 = CollectMemoryStats();
             PrintMemoryStats("Final memory state", stats5);
 

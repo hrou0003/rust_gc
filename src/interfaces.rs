@@ -24,6 +24,7 @@ use std::{
     ffi::c_uint,
     os::raw::{c_char, c_float, c_int, c_void},
 };
+use crate::IGCToCLRVTable;
 
 // C++ HRESULT is a 32-bit signed integer on Windows.
 pub type HRESULT = i32;
@@ -54,7 +55,7 @@ pub struct OBJECTHANDLE__ {
 }
 #[repr(C)]
 pub struct IGCToCLR {
-    _private: [u8; 0],
+    pub vtable: *const IGCToCLRVTable,
 }
 
 #[repr(C)]
@@ -73,7 +74,7 @@ pub type PTR_UNCHECKED_OBJECTREF = *mut Object;
 
 // --- Constants ---
 pub const GC_INTERFACE_MAJOR_VERSION: u32 = 5;
-pub const GC_INTERFACE_MINOR_VERSION: u32 = 4;
+pub const GC_INTERFACE_MINOR_VERSION: u32 = 3;
 pub const EE_INTERFACE_MAJOR_VERSION: u32 = 3;
 
 pub const LARGE_OBJECT_SIZE: usize = 85000;
@@ -627,15 +628,6 @@ pub struct IGCHandleManagerVTable {
 #[repr(C)]
 pub struct IGCHeapFFI {
     pub vtable: *const IGCHeapVTable,
-}
-// Note: The trait methods are omitted for brevity, but a full implementation would list them all.
-// See the VTable definition below for the full list of required functions.
-pub trait IGCHeap {
-    // A full implementation would define all methods from the VTable here.
-    // Example:
-    fn initialize(&mut self) -> HRESULT;
-    fn alloc(&mut self, acontext: *mut gc_alloc_context, size: usize, flags: u32) -> *mut Object;
-    // ... etc.
 }
 
 pub type ConfigurationValueFunc = Option<

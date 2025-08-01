@@ -74,7 +74,6 @@ pub enum SUSPEND_REASON {
 }
 
 // --- Bitflag Enums ---
-
 bitflags! {
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +118,6 @@ bitflags! {
 }
 
 // --- Structs ---
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GcDacVars {
