@@ -35,8 +35,10 @@ pub type HRESULT = i32;
 
 #[repr(C)]
 pub struct Object {
-    _private: [u8; 0],
+    pub method_table: *const c_void,
+    pub length: i32,
 }
+
 #[repr(C)]
 pub struct CrawlFrame {
     _private: [u8; 0],
@@ -359,7 +361,7 @@ pub struct WriteBarrierParameters {
     pub operation: WriteBarrierOp,
     pub is_runtime_suspended: bool,
     pub requires_upper_bounds_check: bool,
-    pub card_table: *mut u32,
+    pub card_table: *mut u8,
     pub card_bundle_table: *mut u32,
     pub lowest_address: *mut u8,
     pub highest_address: *mut u8,
@@ -408,11 +410,11 @@ pub struct EtwGCSettingsInfo {
 pub struct gc_alloc_context {
     pub alloc_ptr: *mut u8,
     pub alloc_limit: *mut u8,
-    pub alloc_bytes: i64,
-    pub alloc_bytes_uoh: i64,
-    pub gc_reserved_1: *mut c_void,
-    pub gc_reserved_2: *mut c_void,
-    pub alloc_count: c_int,
+    pub alloc_bytes: i64,        // Number of bytes allocated on SOH
+    pub alloc_bytes_uoh: i64,    // Number of bytes allocated on UOH (large objects)
+    pub gc_reserved_1: *mut std::ffi::c_void,
+    pub gc_reserved_2: *mut std::ffi::c_void,
+    pub alloc_count: i32,
 }
 
 #[repr(C)]

@@ -1,5 +1,5 @@
 # Use .NET SDK as base
-FROM mcr.microsoft.com/dotnet/sdk:9.0
+FROM mcr.microsoft.com/dotnet/nightly/sdk:10.0-preview
 
 # Install required packages
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \

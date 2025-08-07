@@ -4,6 +4,7 @@ use crate::interfaces::{
     IGCHandleStoreFFI, Object, OBJECTHANDLE, HANDLESCANPROC,
 };
 use std::ffi::c_void;
+use std::mem::forget;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 #[repr(C)]
@@ -21,7 +22,7 @@ impl MyGCHandleManager {
             store: Box::new(MyGCHandleStore::new()),
         }
     }
-
+    
     pub fn create_global_handle_of_type(
         &mut self,
         object: *mut Object,
@@ -55,14 +56,12 @@ extern "C" fn mgr_destroy_handle_store(
 ) {
 }
 
+#[no_mangle]
 extern "C" fn mgr_create_global_handle_of_type(
     this: *mut IGCHandleManagerFFI,
     object: *mut Object,
     type_: HandleType,
 ) -> OBJECTHANDLE {
-    if this.is_null() || object.is_null() {
-        return std::ptr::null_mut();
-    }
 
     let manager = unsafe { &mut *(this as *mut MyGCHandleManager) };
 

@@ -10,6 +10,7 @@ use crate::interfaces::{
 use std::alloc::{alloc_zeroed, Layout};
 use std::ffi::{c_float, c_uint, c_void};
 use std::os::raw::c_int;
+use std::ptr;
 use std::ptr::null_mut;
 
 #[repr(C)]
@@ -17,22 +18,39 @@ pub struct MyGCHeap {
     pub ffi: IGCHeapFFI,
     pub clr_to_gc: *mut IGCToCLR,
     pub handle_manager: Box<MyGCHandleManager>,
+    card_table: *mut u8,
+    heap_start: *mut u8,
+    heap_end: *mut u8,
+    next_alloc: *mut u8, // <-- The global bump pointer
 }
 
 impl MyGCHeap {
     pub(crate) fn new(clr_to_gc: *mut IGCToCLR) -> Self {
+        const CARD_SIZE: usize = 512;
+        let card_table_size = 10 * 1024 * 1024 / CARD_SIZE;
+        let card_table_memory = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(card_table_size, 8))
+        };
+        if card_table_memory.is_null() {
+            panic!("[MyGCHeap] Failed to allocate the card table!");
+        }
         Self {
             ffi: IGCHeapFFI {
                 vtable: &GCHEAP_VTABLE,
             },
             clr_to_gc,
             handle_manager: Box::new(MyGCHandleManager::new()),
+            card_table: card_table_memory,
+            heap_start: 0_usize as *mut u8,
+            heap_end: 0_usize as *mut u8,
+            next_alloc: 0_usize as *mut u8,
         }
     }
 
     // The actual implementation of Initialize
+    #[no_mangle]
     pub(crate) fn initialize_impl(&mut self) -> HRESULT {
-        log!("[MyGCHeap] Initialize called");
+        log!("Initialize called");
 
         // Allocate the handle store now that the runtime is ready.
         let layout =
@@ -43,20 +61,35 @@ impl MyGCHeap {
             panic!("Failed to allocate memory for handle store");
         }
         self.handle_manager.store.store = store_ptr;
-        log!("[MyGCHeap] GCHandleStore allocated at: {:p}", store_ptr);
+        log!("GCHandleStore allocated at: {:p}", store_ptr);
+
+        // Allocate memory for the mock heap and card table.
+        // In a real application, this memory would be managed more carefully.
+        // let mut mock_heap = vec![0u8; MOCK_HEAP_SIZE];
+        // let mut mock_card_table = vec![0u8; MOCK_CARD_TABLE_SIZE];
+        // 
+        // // 3. Get the pointers to the boundaries of your mock heap.
+        // let lowest_address = mock_heap.as_mut_ptr();
+        // let highest_address = unsafe { lowest_address.add(MOCK_HEAP_SIZE) };
+        let MOCK_HEAP_SIZE = 10 * 1024 * 1024;
+        let mut mock_heap = vec![0u8; MOCK_HEAP_SIZE];
+        let lowest_address = mock_heap.as_mut_ptr();
+        self.heap_start = lowest_address;
+        self.heap_end = unsafe { lowest_address.add(MOCK_HEAP_SIZE) };
+        self.next_alloc = lowest_address;
 
         // Set up write barrier parameters to match C# implementation, effectively disabling it.
         let params = WriteBarrierParameters {
             operation: WriteBarrierOp::Initialize,
             is_runtime_suspended: true,
             requires_upper_bounds_check: false, // Ignored for Initialize operation
-            card_table: std::ptr::null_mut(),
+            card_table: self.card_table,
             card_bundle_table: std::ptr::null_mut(),
-            lowest_address: std::ptr::null_mut(),
-            highest_address: std::ptr::null_mut(),
+            lowest_address: !0_usize as *mut u8,
+            highest_address: !10000_usize as *mut u8,
             // C# sets ephemeral_low to ~0 (all bits set) to disable write barriers
             ephemeral_low: !0_usize as *mut u8, // Equivalent to (byte*)(~0) in C#
-            ephemeral_high: std::ptr::null_mut(),
+            ephemeral_high: !10000_usize as *mut u8,
             write_watch_table: std::ptr::null_mut(),
             region_to_generation_table: std::ptr::null_mut(),
             region_shr: 0,
@@ -75,29 +108,55 @@ impl MyGCHeap {
         &mut self,
         acontext: &mut gc_alloc_context,
         size: usize,
-        flags: u32,
+        _flags: u32,
     ) -> *mut Object {
+        // The original C# code does not show alignment, but it's good practice.
+        const ALIGNMENT: usize = 8;
+        let aligned_size = (size + (ALIGNMENT - 1)) & !(ALIGNMENT - 1);
+
         let result = acontext.alloc_ptr;
-        let advance = unsafe { result.add(size) };
+        let advance = unsafe { result.add(aligned_size) };
 
         if advance <= acontext.alloc_limit {
             acontext.alloc_ptr = advance;
             return result as *mut Object;
         }
 
-        let growth_size = size.max(32 * 1024) + std::mem::size_of::<usize>();
-        let new_pages = unsafe { alloc_zeroed(Layout::from_size_align(growth_size, 8).unwrap()) };
-        let allocation_start = unsafe { new_pages.add(std::mem::size_of::<usize>()) };
+        // If the allocation in the current context fails, allocate a new block of memory.
+        const BEGIN_GAP: usize = 24;
+        const GROWTH_SIZE: usize = 16 * 1024 * 1024;
 
-        acontext.alloc_ptr = unsafe { allocation_start.add(size) };
-        acontext.alloc_limit = unsafe { new_pages.add(growth_size) };
+        // Ensure the new allocation is large enough for the requested size.
+        let allocation_size = if aligned_size + BEGIN_GAP > GROWTH_SIZE {
+            aligned_size + BEGIN_GAP
+        } else {
+            GROWTH_SIZE
+        };
+
+        let layout = match Layout::from_size_align(allocation_size, ALIGNMENT) {
+            Ok(l) => l,
+            Err(_) => {
+                eprintln!("[MyRustGC] FATAL: Failed to create memory layout!");
+                return ptr::null_mut();
+            }
+        };
+
+        let new_pages = unsafe { alloc_zeroed(layout) };
+
+        if new_pages.is_null() {
+            eprintln!("[MyRustGC] FATAL: Out of memory!");
+            return ptr::null_mut();
+        }
+
+        let allocation_start = unsafe { new_pages.add(BEGIN_GAP) };
+        acontext.alloc_ptr = unsafe { allocation_start.add(aligned_size) };
+        acontext.alloc_limit = unsafe { new_pages.add(allocation_size) };
 
         allocation_start as *mut Object
     }
 
     pub(crate) fn garbage_collect_impl(&mut self, generation: i32) -> HRESULT {
         log!("GarbageCollect called for generation {}", generation);
-        self.handle_manager.store.dump_handles_impl();
         0 // S_OK
     }
 }
@@ -109,6 +168,8 @@ extern "C" fn heap_initialize(this: *mut IGCHeapFFI) -> HRESULT {
     let heap = unsafe { &mut *(this as *mut MyGCHeap) };
     heap.initialize_impl()
 }
+
+#[no_mangle]
 extern "C" fn heap_alloc(
     this: *mut IGCHeapFFI,
     acontext: *mut gc_alloc_context,
@@ -119,6 +180,7 @@ extern "C" fn heap_alloc(
     let acontext_ref = unsafe { &mut *acontext };
     heap.alloc_impl(acontext_ref, size, flags)
 }
+
 extern "C" fn heap_garbage_collect(
     this: *mut IGCHeapFFI,
     generation: c_int,
@@ -406,13 +468,14 @@ extern "C" fn is_promoted(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
     false
 }
 
+#[no_mangle]
 extern "C" fn is_heap_pointer(
     this: *mut IGCHeapFFI,
     object: *mut c_void,
     small_heap_only: bool,
 ) -> bool {
     log!("is_heap_pointer");
-    false
+    !object.is_null()
 }
 
 extern "C" fn get_condemned_generation(this: *mut IGCHeapFFI) -> c_uint {
@@ -665,9 +728,12 @@ extern "C" fn is_in_frozen_segment(this: *mut IGCHeapFFI, object: *mut Object) -
 }
 
 // Event Control
+#[no_mangle]
 extern "C" fn control_events(this: *mut IGCHeapFFI, keyword: GCEventKeyword, level: GCEventLevel) {
     log!("control_events")
 }
+
+#[no_mangle]
 extern "C" fn control_private_events(
     this: *mut IGCHeapFFI,
     keyword: GCEventKeyword,

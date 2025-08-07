@@ -9,6 +9,7 @@ use std::ptr::{null_mut, read_unaligned};
 pub struct MyGCHeap {
     pub ffi: IGCHeapFFI,
     pub clr_to_gc: *mut IGCToCLR,
+    heap_start: *mut u8,
     next_alloc_ptr: *mut u8,
     alloc_limit: *mut u8,
     pub handle_manager: Box<MyGCHandleManager>,
@@ -17,8 +18,8 @@ pub struct MyGCHeap {
 impl MyGCHeap {
     pub fn new(clr_to_gc: *mut IGCToCLR) -> Self {
         // Allocate a 100MB heap
-        const HEAP_SIZE: usize = 100 * 1024 * 1024;
-        let mut heap_memory = Vec::with_capacity(HEAP_SIZE);
+        const HEAP_SIZE: usize = 10 * 1024 * 1024;
+        let heap_memory = vec![0u8; HEAP_SIZE];
         let ptr = heap_memory.as_mut_ptr();
         std::mem::forget(heap_memory); // Prevent Rust from freeing the memory
 
@@ -27,6 +28,7 @@ impl MyGCHeap {
                 vtable: &GCHEAP_VTABLE,
             },
             clr_to_gc,
+            heap_start: ptr,
             next_alloc_ptr: ptr,
             alloc_limit: unsafe { ptr.add(HEAP_SIZE) },
             handle_manager: Box::new(MyGCHandleManager::new()),
@@ -35,8 +37,19 @@ impl MyGCHeap {
 
     pub fn initialize_impl(&mut self) -> HRESULT {
         log!("InitializeImpl called");
-        // In a real GC, we'd set up heap segments, thread contexts, etc.
-        // For this example, most of the setup is done in `new`.
+
+        // The runtime might query for an initial allocation context
+        // Initialize a dummy one
+        let dummy_context = gc_alloc_context {
+            alloc_ptr: self.heap_start,
+            alloc_limit: self.heap_start, // Start with no available space
+            alloc_bytes: 0,
+            alloc_bytes_uoh: 0,
+            gc_reserved_1: null_mut(),
+            gc_reserved_2: null_mut(),
+            alloc_count: 0,
+        };
+
         0 // S_OK
     }
 
@@ -47,18 +60,32 @@ impl MyGCHeap {
         size: usize,
         flags: u32,
     ) -> *mut Object {
-        let align = std::mem::size_of::<usize>();
-        let mut alloc_size = size + align;
-        if let Some(mut mt) = unsafe { (acontext.alloc_ptr as *mut *mut u8).as_mut() } {
-            let obj = self.next_alloc_ptr;
-            let new_next_alloc_ptr = unsafe { self.next_alloc_ptr.add(alloc_size) };
-            if new_next_alloc_ptr > self.alloc_limit {
-                return null_mut();
-            }
-            self.next_alloc_ptr = new_next_alloc_ptr;
-            return obj as *mut Object;
+        let result = acontext.alloc_ptr;
+        let advance = result.add(size as usize);
+
+        if advance <= acontext.alloc_limit {
+            acontext.alloc_ptr = advance;
+            return result as *mut GCObject;
         }
-        null_mut()
+
+        // If the current allocation space is insufficient, allocate a new region.
+        let begin_gap = 24;
+        let growth_size = 16 * 1024 * 1024;
+
+        // The layout describes the size and alignment of the memory to allocate.
+        let layout = Layout::from_size_align_unchecked(growth_size, 1);
+        let new_pages = alloc_zeroed(layout);
+
+        if new_pages.is_null() {
+            // In a real-world application, you would handle this allocation failure gracefully.
+            panic!("Failed to allocate memory");
+        }
+
+        let allocation_start = new_pages.add(begin_gap);
+        acontext.alloc_ptr = allocation_start.add(size as usize);
+        acontext.alloc_limit = new_pages.add(growth_size);
+
+        allocation_start as *mut GCObject
     }
 }
 
@@ -80,9 +107,12 @@ extern "C" fn heap_alloc(
     size: usize,
     flags: u32,
 ) -> *mut Object {
+    log!("heap_alloc called: size={}, flags={}", size, flags);
     let heap = unsafe { &mut *(this as *mut MyGCHeap) };
     let acontext_ref = unsafe { &mut *acontext };
-    heap.alloc_impl(acontext_ref, size, flags)
+    let result = heap.alloc_impl(acontext_ref, size, flags);
+    log!("heap_alloc returning: {:?}", result);
+    result
 }
 
 // This is the main entry point for a garbage collection.
@@ -171,8 +201,10 @@ extern "C" fn heap_get_gc_data_per_heap(
 }
 
 extern "C" fn heap_initialize(this: *mut IGCHeapFFI) -> HRESULT {
+    log!("Initialize called");
     let heap = unsafe { &mut *(this as *mut MyGCHeap) };
-    heap.initialize_impl()
+    heap.initialize_impl();
+    0 // S_OK
 }
 
 extern "C" fn set_card_table(this: *mut IGCHeapFFI, card_table: *mut u8, card_size: u32) {
@@ -232,8 +264,21 @@ extern "C" fn get_generation_boundaries(
     end: *mut *mut u8,
     eff_end: *mut *mut u8,
 ) -> bool {
-    log!("GetGenerationBoundaries");
-    false
+    log!("GetGenerationBoundaries called");
+    let heap = unsafe { &mut *(this as *mut MyGCHeap) };
+    unsafe {
+        if !start.is_null() {
+            *start = heap.heap_start;
+        }
+        if !end.is_null() {
+            *end = heap.alloc_limit;
+        }
+        if !eff_end.is_null() {
+            // The effective end is the pointer to the next available spot.
+            *eff_end = heap.next_alloc_ptr;
+        }
+    }
+    true
 }
 
 extern "C" fn wait_for_gc_done(this: *mut IGCHeapFFI) -> i32 {
@@ -248,7 +293,7 @@ extern "C" fn get_gc_done_event(this: *mut IGCHeapFFI) -> usize {
 
 extern "C" fn get_number_of_heaps() -> u32 {
     log!("GetNumberOfHeaps");
-    1 // We are a single-heap GC
+    1
 }
 
 extern "C" fn get_heap(this: *mut IGCHeapFFI, heap_index: u32) -> *mut IGCHeapFFI {
@@ -256,18 +301,23 @@ extern "C" fn get_heap(this: *mut IGCHeapFFI, heap_index: u32) -> *mut IGCHeapFF
     this
 }
 
-extern "C" fn is_thread_using_alloc_context(this: *mut IGCHeapFFI) -> bool {
+extern "C" fn heap_is_thread_using_alloc_context(this: *mut IGCHeapFFI) -> bool {
     log!("IsThreadUsingAllocContext");
-    true
+    false  // Try returning false - no thread has an active context yet
 }
 
 extern "C" fn is_valid_segment_pointer(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
     log!("IsValidSegmentPointer");
-    false
+    let heap = unsafe { &mut *(this as *mut MyGCHeap) };
+    let ptr = object as *mut u8;
+    ptr >= heap.heap_start && ptr < heap.alloc_limit
 }
 
-extern "C" fn is_valid_object_pointer(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
-    log!("IsValidObjectPointer");
+extern "C" fn heap_is_valid_object_pointer(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
+    log!("IsValidObjectPointer for {:?}", object);
+    if object.is_null() {
+        return false;
+    }
     true
 }
 
@@ -277,8 +327,11 @@ extern "C" fn get_next_object(this: *mut IGCHeapFFI, object: *mut Object) -> *mu
 }
 
 extern "C" fn get_size(this: *mut IGCHeapFFI, object: *mut Object) -> usize {
-    log!("GetSize");
-    unsafe { read_unaligned((object as *mut usize).offset(-1)) }
+    log!("GetSize called for object {:?}", object);
+    // Don't try to read uninitialized memory - return a reasonable default
+    let default_size = 32; // Assume 32 bytes for now
+    log!("Returning size: {}", default_size);
+    default_size
 }
 
 extern "C" fn sync_for_finalization(this: *mut IGCHeapFFI) {
@@ -342,7 +395,7 @@ extern "C" fn end_no_gc_region(this: *mut IGCHeapFFI) -> i32 {
 
 extern "C" fn get_total_bytes_in_use(this: *mut IGCHeapFFI) -> usize {
     log!("GetTotalBytesInUse");
-    0
+    0 // Nothing allocated yet
 }
 
 extern "C" fn is_large_object(this: *mut IGCHeapFFI, obj: *mut Object) -> bool {
@@ -355,7 +408,23 @@ extern "C" fn get_memory_info(
     total_committed: *mut u64,
     total_reserved: *mut u64,
 ) {
-    log!("GetMemoryInfo");
+    log!("GetMemoryInfo called");
+    // Get a mutable reference to the MyGCHeap struct from the 'this' pointer.
+    let heap = unsafe { &mut *(this as *mut MyGCHeap) };
+
+    // Calculate the total size of the heap.
+    // In this simple allocator, the reserved and committed sizes are the same.
+    let heap_size = heap.alloc_limit as usize - heap.heap_start as usize;
+
+    unsafe {
+        // Report the actual size of the allocated heap.
+        if !total_committed.is_null() {
+            *total_committed = heap_size as u64;
+        }
+        if !total_reserved.is_null() {
+            *total_reserved = heap_size as u64;
+        }
+    }
 }
 
 extern "C" fn is_server_gc() -> bool {

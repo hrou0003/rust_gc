@@ -18,39 +18,112 @@ mod gc_handle_store;
 use interfaces::*;
 
 use crate::gc_heap::MyGCHeap;
-use std::ffi::{c_uint, c_void};
+use std::ffi::{c_char, c_uint, c_void};
 use std::os::raw::c_int;
 use std::ptr::null_mut;
 
 // --- IGCToCLR (Interface provided by the EE to the GC) ---
 #[repr(C)]
 pub struct IGCToCLRVTable {
-    // This is an incomplete VTable, we only add the methods we need.
-    // The real VTable has many more functions. The offsets must be correct.
-    // To be safe, we list dummy entries for unknown methods.
-    _dummy0: [usize; 2], // Two initial methods we don't use
-    pub SuspendEE: extern "C" fn(this: *mut IGCToCLR, reason: SUSPEND_REASON) -> HRESULT,
-    pub ResumeEE: extern "C" fn(this: *mut IGCToCLR, completed: bool) -> HRESULT,
+    pub SuspendEE: extern "C" fn(this: *mut IGCToCLR, reason: SUSPEND_REASON),
+    pub RestartEE: extern "C" fn(this: *mut IGCToCLR, bFinishedGC: bool),
     pub GcScanRoots: extern "C" fn(
         this: *mut IGCToCLR,
-        promote_fn: promote_func,
-        condemned_generation_number: c_int,
+        fn_ptr: promote_func,
+        condemned: c_int,
+        max_gen: c_int,
         sc: *mut ScanContext,
     ),
-    pub RestartEE: extern "C" fn(this: *mut IGCToCLR, completed: bool),
-    _dummy1: [usize; 11], // more unused methods
+    pub GcStartWork: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, max_gen: c_int),
+    pub BeforeGcScanRoots: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, is_bgc: bool, is_concurrent: bool),
+    pub AfterGcScanRoots: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, max_gen: c_int, sc: *mut ScanContext),
+    pub GcDone: extern "C" fn(this: *mut IGCToCLR, condemned: c_int),
+    pub RefCountedHandleCallbacks: extern "C" fn(this: *mut IGCToCLR, pObject: *mut Object) -> bool,
+    pub SyncBlockCacheWeakPtrScan:
+        extern "C" fn(this: *mut IGCToCLR, scanProc: HANDLESCANPROC, lp1: usize, lp2: usize),
+    pub SyncBlockCacheDemote: extern "C" fn(this: *mut IGCToCLR, max_gen: c_int),
+    pub SyncBlockCachePromotionsGranted: extern "C" fn(this: *mut IGCToCLR, max_gen: c_int),
+    pub GetActiveSyncBlockCount: extern "C" fn(this: *mut IGCToCLR) -> u32,
+    pub IsPreemptiveGCDisabled: extern "C" fn(this: *mut IGCToCLR) -> bool,
+    pub EnablePreemptiveGC: extern "C" fn(this: *mut IGCToCLR) -> bool,
+    pub DisablePreemptiveGC: extern "C" fn(this: *mut IGCToCLR),
+    pub GetThread: extern "C" fn(this: *mut IGCToCLR) -> *mut Thread,
+    pub GetAllocContext: extern "C" fn(this: *mut IGCToCLR) -> *mut gc_alloc_context,
+    pub GcEnumAllocContexts:
+        extern "C" fn(this: *mut IGCToCLR, fn_ptr: enum_alloc_context_func, param: *mut std::ffi::c_void),
+    pub GetLoaderAllocatorObjectForGC: extern "C" fn(this: *mut IGCToCLR, pObject: *mut Object) -> *mut u8,
+    pub CreateThread: extern "C" fn(
+        this: *mut IGCToCLR,
+        threadStart: extern "C" fn(*mut std::ffi::c_void),
+        arg: *mut std::ffi::c_void,
+        is_suspendable: bool,
+        name: *const c_char,
+    ) -> bool,
+    pub DiagGCStart: extern "C" fn(this: *mut IGCToCLR, gen: c_int, isInduced: bool),
+    pub DiagUpdateGenerationBounds: extern "C" fn(this: *mut IGCToCLR),
+    pub DiagGCEnd: extern "C" fn(this: *mut IGCToCLR, index: usize, gen: c_int, reason: c_int, fConcurrent: bool),
+    pub DiagWalkFReachableObjects: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void),
+    pub DiagWalkSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, fCompacting: bool),
+    pub DiagWalkUOHSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, gen: c_int),
+    pub DiagWalkBGCSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void),
+    pub StompWriteBarrier: extern "C" fn(this: *mut IGCToCLR, args: *const WriteBarrierParameters),
+    pub EnableFinalization: extern "C" fn(this: *mut IGCToCLR, gcHasWorkForFinalizerThread: bool),
+    pub HandleFatalError: extern "C" fn(this: *mut IGCToCLR, exitCode: u32),
+    pub EagerFinalized: extern "C" fn(this: *mut IGCToCLR, obj: *mut Object) -> bool,
+    pub GetFreeObjectMethodTable: extern "C" fn(this: *mut IGCToCLR) -> *mut MethodTable,
     pub GetBooleanConfigValue: extern "C" fn(
         this: *mut IGCToCLR,
-        name: *const u8,
-        public_name: *const u8,
-        out_val: *mut bool,
+        privateKey: *const c_char,
+        publicKey: *const c_char,
+        value: *mut bool,
     ) -> bool,
-    _dummy2: [usize; 7], // more unused methods
-    pub StompWriteBarrier:
-        extern "C" fn(this: *mut IGCToCLR, params: *const WriteBarrierParameters),
-    // ... and many more we don't need for this example
+    pub GetIntConfigValue: extern "C" fn(
+        this: *mut IGCToCLR,
+        privateKey: *const c_char,
+        publicKey: *const c_char,
+        value: *mut i64,
+    ) -> bool,
+    pub GetStringConfigValue: extern "C" fn(
+        this: *mut IGCToCLR,
+        privateKey: *const c_char,
+        publicKey: *const c_char,
+        value: *mut *const c_char,
+    ) -> bool,
+    pub FreeStringConfigValue: extern "C" fn(this: *mut IGCToCLR, value: *const c_char),
+    pub IsGCThread: extern "C" fn(this: *mut IGCToCLR) -> bool,
+    pub WasCurrentThreadCreatedByGC: extern "C" fn(this: *mut IGCToCLR) -> bool,
+    pub WalkAsyncPinnedForPromotion:
+        extern "C" fn(this: *mut IGCToCLR, object: *mut Object, sc: *mut ScanContext, callback: promote_func),
+    pub WalkAsyncPinned: extern "C" fn(
+        this: *mut IGCToCLR,
+        object: *mut Object,
+        context: *mut std::ffi::c_void,
+        callback: extern "C" fn(*mut Object, *mut Object, *mut std::ffi::c_void),
+    ),
+    pub EventSink: extern "C" fn(this: *mut IGCToCLR) -> *mut IGCToCLREventSink,
+    pub GetTotalNumSizedRefHandles: extern "C" fn(this: *mut IGCToCLR) -> u32,
+    pub AnalyzeSurvivorsRequested: extern "C" fn(this: *mut IGCToCLR, condemnedGeneration: c_int) -> bool,
+    pub AnalyzeSurvivorsFinished: extern "C" fn(
+        this: *mut IGCToCLR,
+        gcIndex: usize,
+        condemnedGeneration: c_int,
+        promoted_bytes: u64,
+        reportGenerationBounds: extern "C" fn(),
+    ),
+    pub VerifySyncTableEntry: extern "C" fn(this: *mut IGCToCLR),
+    pub UpdateGCEventStatus: extern "C" fn(this: *mut IGCToCLR, publicLevel: c_int, publicKeywords: c_int, privateLEvel: c_int, privateKeywords: c_int),
+    pub LogStressMsg: extern "C" fn(this: *mut IGCToCLR, level: u32, facility: u32, msg: *const StressLogMsg),
+    pub GetCurrentProcessCpuCount: extern "C" fn(this: *mut IGCToCLR) -> u32,
+    pub DiagAddNewRegion: extern "C" fn(this: *mut IGCToCLR, generation: c_int, rangeStart: *mut u8, rangeEnd: *mut u8, rangeEndReserved: *mut u8),
+    pub LogErrorToHost: extern "C" fn(this: *mut IGCToCLR, message: *const c_char),
+    pub GetThreadOSThreadId: extern "C" fn(this: *mut IGCToCLR, thread: *mut Thread) -> u64,
+    pub TriggerClientBridgeProcessing: extern "C" fn(this: *mut IGCToCLR, args: *mut MarkCrossReferencesArgs),
 }
 
+pub enum MethodTable {}
+pub enum IGCToCLREventSink {}
+pub enum MarkCrossReferencesArgs {}
+pub enum StressLogMsg {}
 
 impl IGCToCLR {
     // Helper to safely call a VTable method.
@@ -125,6 +198,7 @@ pub extern "C" fn GC_Initialize(
 
     0 // S_OK
 }
+
 #[no_mangle]
 pub unsafe extern "C" fn GC_VersionInfo(version_info: *mut VersionInfo) {
     if version_info.is_null() {
