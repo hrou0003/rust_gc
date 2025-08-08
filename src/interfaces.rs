@@ -33,11 +33,18 @@ pub type HRESULT = i32;
 // These are types defined elsewhere (like gcinterface.ee.h) or are used as opaque pointers.
 // We define them as empty, C-compatible structs for type safety in pointers.
 
+// Rust
+#[repr(C)]
+pub struct MethodTable {
+    _private: [u8; 0], // opaque
+}
+
 #[repr(C)]
 pub struct Object {
-    pub method_table: *const c_void,
-    pub length: i32,
+    // Matches CoreCLR: first field is MethodTable*
+    pub method_table: *mut MethodTable,
 }
+
 
 #[repr(C)]
 pub struct CrawlFrame {
@@ -257,8 +264,9 @@ pub enum gc_kind {
 }
 
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandleType {
+    #[default]
     WEAK_SHORT = 0,
     WEAK_LONG = 1,
     STRONG = 2,

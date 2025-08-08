@@ -1,5 +1,4 @@
 use crate::gc_handle_manager::MyGCHandleManager;
-use crate::gc_handle_store::MAX_HANDLES;
 use crate::interfaces::{
     enable_no_gc_region_callback_status, gc_alloc_context, walk_fn, walk_fn2, walk_surv_type,
     ConfigurationValueFunc, EtwGCSettingsInfo, FinalizerWorkItem, GCEventKeyword, GCEventLevel,
@@ -7,7 +6,7 @@ use crate::interfaces::{
     Object, WriteBarrierOp, WriteBarrierParameters, fq_scan_fn, fq_walk_fn, gen_walk_fn,
     handle_scan_fn, record_surv_fn, segment_handle, segment_info,
 };
-use std::alloc::{alloc_zeroed, Layout};
+use std::alloc::{alloc, alloc_zeroed, Layout};
 use std::ffi::{c_float, c_uint, c_void};
 use std::os::raw::c_int;
 use std::ptr;
@@ -18,80 +17,80 @@ pub struct MyGCHeap {
     pub ffi: IGCHeapFFI,
     pub clr_to_gc: *mut IGCToCLR,
     pub handle_manager: Box<MyGCHandleManager>,
-    card_table: *mut u8,
-    heap_start: *mut u8,
-    heap_end: *mut u8,
-    next_alloc: *mut u8, // <-- The global bump pointer
+    pub heap_start: *mut u8,
+    pub next_alloc_ptr: *mut u8,
+    pub alloc_limit: *mut u8
+    // The heap state is managed entirely through the gc_alloc_context,
+    // so no top-level heap pointers are needed here, matching the C++ ZeroGCHeap design.
+}
+
+const ARENA_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+const ALIGN: usize = 8; // .NET objects are 8-byte aligned on 64-bit targets
+const OBJ_HEADER_BYTES: usize = std::mem::size_of::<usize>();
+const OBJ_ALIGN: usize = 8;
+#[inline]
+fn align_up(ptr: *mut u8, align: usize) -> *mut u8 {
+    debug_assert!(align.is_power_of_two());
+    let addr = ptr as usize;
+    let aligned = (addr + (align - 1)) & !(align - 1);
+    aligned as *mut u8
 }
 
 impl MyGCHeap {
     pub(crate) fn new(clr_to_gc: *mut IGCToCLR) -> Self {
-        const CARD_SIZE: usize = 512;
-        let card_table_size = 10 * 1024 * 1024 / CARD_SIZE;
-        let card_table_memory = unsafe {
-            std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(card_table_size, 8))
-        };
-        if card_table_memory.is_null() {
-            panic!("[MyGCHeap] Failed to allocate the card table!");
-        }
         Self {
             ffi: IGCHeapFFI {
                 vtable: &GCHEAP_VTABLE,
             },
             clr_to_gc,
             handle_manager: Box::new(MyGCHandleManager::new()),
-            card_table: card_table_memory,
-            heap_start: 0_usize as *mut u8,
-            heap_end: 0_usize as *mut u8,
-            next_alloc: 0_usize as *mut u8,
+            alloc_limit: 0 as *mut u8,
+            next_alloc_ptr: 0 as *mut u8,
+            heap_start: 0 as *mut u8,
         }
     }
 
-    // The actual implementation of Initialize
+    // The actual implementation of Initialize, matching C++ ZeroGCHeap.
     #[no_mangle]
     pub(crate) fn initialize_impl(&mut self) -> HRESULT {
         log!("Initialize called");
 
-        // Allocate the handle store now that the runtime is ready.
-        let layout =
-            std::alloc::Layout::array::<*mut crate::interfaces::Object>(MAX_HANDLES).unwrap();
-        let store_ptr =
-            unsafe { std::alloc::alloc_zeroed(layout) as *mut *mut crate::interfaces::Object };
-        if store_ptr.is_null() {
-            panic!("Failed to allocate memory for handle store");
+        // 1) Reserve a simple bump-pointer arena for the managed heap.
+        // Pick a size large enough for startup.
+        const HEAP_BYTES: usize = 128 * 1024 * 1024; // 64 MiB
+
+        // Allocate raw memory and leak it (simple bring-up)
+        let layout = std::alloc::Layout::from_size_align(HEAP_BYTES, 16).unwrap();
+        let arena = unsafe { std::alloc::alloc(layout) };
+        if arena.is_null() {
+            panic!("[MyGCHeap] Failed to allocate heap arena");
         }
-        self.handle_manager.store.store = store_ptr;
-        log!("GCHandleStore allocated at: {:p}", store_ptr);
 
-        // Allocate memory for the mock heap and card table.
-        // In a real application, this memory would be managed more carefully.
-        // let mut mock_heap = vec![0u8; MOCK_HEAP_SIZE];
-        // let mut mock_card_table = vec![0u8; MOCK_CARD_TABLE_SIZE];
-        // 
-        // // 3. Get the pointers to the boundaries of your mock heap.
-        // let lowest_address = mock_heap.as_mut_ptr();
-        // let highest_address = unsafe { lowest_address.add(MOCK_HEAP_SIZE) };
-        let MOCK_HEAP_SIZE = 10 * 1024 * 1024;
-        let mut mock_heap = vec![0u8; MOCK_HEAP_SIZE];
-        let lowest_address = mock_heap.as_mut_ptr();
-        self.heap_start = lowest_address;
-        self.heap_end = unsafe { lowest_address.add(MOCK_HEAP_SIZE) };
-        self.next_alloc = lowest_address;
+        // Initialize bump pointers
+        self.heap_start = arena;
+        self.next_alloc_ptr = arena;
+        self.alloc_limit = unsafe { arena.add(HEAP_BYTES) };
 
-        // Set up write barrier parameters to match C# implementation, effectively disabling it.
+        // 2) Keep your current write-barrier initialization
+        // (dummy card table and extreme bounds) as you already had.
+        let dummy_card_table_layout = Layout::new::<u32>();
+        let dummy_card_table = unsafe { alloc(dummy_card_table_layout) as *mut u8 };
+        if dummy_card_table.is_null() {
+            panic!("[MyGCHeap] Failed to allocate dummy card table!");
+        }
+
         let params = WriteBarrierParameters {
             operation: WriteBarrierOp::Initialize,
             is_runtime_suspended: true,
-            requires_upper_bounds_check: false, // Ignored for Initialize operation
-            card_table: self.card_table,
-            card_bundle_table: std::ptr::null_mut(),
+            requires_upper_bounds_check: false,
+            card_table: dummy_card_table,
+            card_bundle_table: ptr::null_mut(),
             lowest_address: !0_usize as *mut u8,
-            highest_address: !10000_usize as *mut u8,
-            // C# sets ephemeral_low to ~0 (all bits set) to disable write barriers
-            ephemeral_low: !0_usize as *mut u8, // Equivalent to (byte*)(~0) in C#
-            ephemeral_high: !10000_usize as *mut u8,
-            write_watch_table: std::ptr::null_mut(),
-            region_to_generation_table: std::ptr::null_mut(),
+            highest_address: 1_usize as *mut u8,
+            ephemeral_low: !0_usize as *mut u8,
+            ephemeral_high: 1_usize as *mut u8,
+            write_watch_table: ptr::null_mut(),
+            region_to_generation_table: ptr::null_mut(),
             region_shr: 0,
             region_use_bitwise_write_barrier: false,
         };
@@ -100,63 +99,69 @@ impl MyGCHeap {
             (*self.clr_to_gc).stomp_write_barrier(&params);
         }
 
-        log!("GCHeap initialization completed successfully");
+        log!("GCHeap initialization completed successfully.");
         0 // S_OK
     }
 
-    pub(crate) fn alloc_impl(
+
+    // Rust
+    // The core allocation logic: refill the thread's alloc context from our single arena.
+    // Objects always come from [heap_start .. alloc_limit), so IsHeapPointer will succeed.
+    // alloc_ptr is always the header address; we bump by header + aligned payload
+    pub fn alloc_impl(
         &mut self,
         acontext: &mut gc_alloc_context,
         size: usize,
         _flags: u32,
     ) -> *mut Object {
-        // The original C# code does not show alignment, but it's good practice.
-        const ALIGNMENT: usize = 8;
-        let aligned_size = (size + (ALIGNMENT - 1)) & !(ALIGNMENT - 1);
+        let payload = (size + (OBJ_ALIGN - 1)) & !(OBJ_ALIGN - 1);
+        let total = OBJ_HEADER_BYTES + payload;
 
-        let result = acontext.alloc_ptr;
-        let advance = unsafe { result.add(aligned_size) };
+        // Fast path in the current slice
+        let header_ptr = align_up(acontext.alloc_ptr, OBJ_HEADER_BYTES);
+        let fast_end = unsafe { header_ptr.add(total) };
+        if fast_end <= acontext.alloc_limit {
+            let obj = unsafe { header_ptr.add(OBJ_HEADER_BYTES) as *mut Object };
+            // Zero header + payload
+            unsafe { ptr::write_bytes(header_ptr, 0, total) };
+            acontext.alloc_ptr = fast_end;
 
-        if advance <= acontext.alloc_limit {
-            acontext.alloc_ptr = advance;
-            return result as *mut Object;
+            debug_assert_eq!((obj as usize) & (OBJ_ALIGN - 1), 0);
+            return obj;
         }
+        
+        // Asset allocation is within range
+        debug_assert!(self.next_alloc_ptr < self.alloc_limit);
 
-        // If the allocation in the current context fails, allocate a new block of memory.
-        const BEGIN_GAP: usize = 24;
-        const GROWTH_SIZE: usize = 16 * 1024 * 1024;
+        // Refill from global arena
+        const REFILL_CHUNK: usize = 256 * 1024;
+        let refill_bytes = total.max(REFILL_CHUNK);
 
-        // Ensure the new allocation is large enough for the requested size.
-        let allocation_size = if aligned_size + BEGIN_GAP > GROWTH_SIZE {
-            aligned_size + BEGIN_GAP
-        } else {
-            GROWTH_SIZE
-        };
-
-        let layout = match Layout::from_size_align(allocation_size, ALIGNMENT) {
-            Ok(l) => l,
-            Err(_) => {
-                eprintln!("[MyRustGC] FATAL: Failed to create memory layout!");
-                return ptr::null_mut();
-            }
-        };
-
-        let new_pages = unsafe { alloc_zeroed(layout) };
-
-        if new_pages.is_null() {
-            eprintln!("[MyRustGC] FATAL: Out of memory!");
+        self.next_alloc_ptr = align_up(self.next_alloc_ptr, OBJ_HEADER_BYTES);
+        let new_end = unsafe { self.next_alloc_ptr.add(refill_bytes) };
+        if new_end > self.alloc_limit {
             return ptr::null_mut();
         }
 
-        let allocation_start = unsafe { new_pages.add(BEGIN_GAP) };
-        acontext.alloc_ptr = unsafe { allocation_start.add(aligned_size) };
-        acontext.alloc_limit = unsafe { new_pages.add(allocation_size) };
+        acontext.alloc_ptr = self.next_alloc_ptr;
+        acontext.alloc_limit = new_end;
+        self.next_alloc_ptr = new_end;
 
-        allocation_start as *mut Object
+        // Allocate in the new slice
+        let header_ptr = align_up(acontext.alloc_ptr, OBJ_HEADER_BYTES);
+        let obj = unsafe { header_ptr.add(OBJ_HEADER_BYTES) as *mut Object };
+        unsafe {
+            ptr::write_bytes(header_ptr, 0, total);
+            acontext.alloc_ptr = header_ptr.add(total);
+        }
+        debug_assert_eq!((obj as usize) & (OBJ_ALIGN - 1), 0);
+        log!("heap allocated {:?}", obj);
+        obj
     }
 
-    pub(crate) fn garbage_collect_impl(&mut self, generation: i32) -> HRESULT {
-        log!("GarbageCollect called for generation {}", generation);
+    // Implementation of GarbageCollect, matching C++ ZeroGCHeap::GarbageCollect
+    pub(crate) fn garbage_collect_impl(&mut self, _generation: i32) -> HRESULT {
+        // Does nothing, just like the C++ version.
         0 // S_OK
     }
 }
@@ -184,77 +189,84 @@ extern "C" fn heap_alloc(
 extern "C" fn heap_garbage_collect(
     this: *mut IGCHeapFFI,
     generation: c_int,
-    low_mem: bool,
-    mode: c_int,
+    _low_mem: bool,
+    _mode: c_int,
 ) -> HRESULT {
     let heap = unsafe { &mut *(this as *mut MyGCHeap) };
     heap.garbage_collect_impl(generation)
 }
-
-extern "C" fn is_valid_segment_size(this: *mut IGCHeapFFI, size: usize) -> bool {
-    log!("IsValidSegmentSize");
-    false // C# implementation returns false
+extern "C" fn get_max_generation(_this: *mut IGCHeapFFI) -> c_uint {
+    log!("GetMaxGeneration");
+    1 // Match C++ implementation
 }
 
-extern "C" fn is_valid_gen0_max_size(this: *mut IGCHeapFFI, size: usize) -> bool {
-    log!("IsValidGen0MaxSize");
-    false // C# implementation returns false
+#[no_mangle]
+extern "C" fn is_heap_pointer(
+    this: *mut IGCHeapFFI,
+    object: *mut c_void,
+    _small_heap_only: bool,
+) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    // Cast the FFI object back to your heap type
+    let heap = unsafe { &*(this as *mut MyGCHeap) };
+
+    let ptr = object as *mut u8;
+    // Return true only if the pointer is inside the managed heap arena
+    let is_heap_pointer = unsafe { heap.heap_start <= ptr && ptr < heap.next_alloc_ptr };
+    log!("is_heap_pointer {:?}, {}", ptr, is_heap_pointer);
+    is_heap_pointer
 }
 
-extern "C" fn get_valid_segment_size(this: *mut IGCHeapFFI, large_seg: bool) -> usize {
-    log!("GetValidSegmentSize");
-    0 // C# implementation returns 0
+
+// --- The rest of the VTable functions are stubs, matching the C++ implementation ---
+
+extern "C" fn is_valid_segment_size(_this: *mut IGCHeapFFI, _size: usize) -> bool {
+    false
 }
 
-extern "C" fn set_reserved_vm_limit(this: *mut IGCHeapFFI, vmlimit: usize) {
-    log!("SetReservedVMLimit");
+extern "C" fn is_valid_gen0_max_size(_this: *mut IGCHeapFFI, _size: usize) -> bool {
+    false
 }
 
-// Concurrent GC
-extern "C" fn wait_until_concurrent_gc_complete(this: *mut IGCHeapFFI) {
-    log!("WaitUntilConcurrentGCComplete");
+extern "C" fn get_valid_segment_size(_this: *mut IGCHeapFFI, _large_seg: bool) -> usize {
+    0
 }
 
-extern "C" fn is_concurrent_gc_in_progress(this: *mut IGCHeapFFI) -> bool {
-    log!("IsConcurrentGCInProgress");
-    false // C# implementation returns false
+extern "C" fn set_reserved_vm_limit(_this: *mut IGCHeapFFI, _vmlimit: usize) {}
+
+extern "C" fn wait_until_concurrent_gc_complete(_this: *mut IGCHeapFFI) {}
+
+extern "C" fn is_concurrent_gc_in_progress(_this: *mut IGCHeapFFI) -> bool {
+    false
 }
 
-extern "C" fn temporary_enable_concurrent_gc(this: *mut IGCHeapFFI) {
-    log!("TemporaryEnableConcurrentGC");
-}
+extern "C" fn temporary_enable_concurrent_gc(_this: *mut IGCHeapFFI) {}
 
-extern "C" fn temporary_disable_concurrent_gc(this: *mut IGCHeapFFI) {
-    log!("TemporaryDisableConcurrentGC");
-}
+extern "C" fn temporary_disable_concurrent_gc(_this: *mut IGCHeapFFI) {}
 
-extern "C" fn is_concurrent_gc_enabled(this: *mut IGCHeapFFI) -> bool {
-    log!("IsConcurrentGCEnabled");
-    false // C# implementation returns false
+extern "C" fn is_concurrent_gc_enabled(_this: *mut IGCHeapFFI) -> bool {
+    false
 }
 
 extern "C" fn wait_until_concurrent_gc_complete_async(
-    this: *mut IGCHeapFFI,
-    millisecondsTimeout: c_int,
+    _this: *mut IGCHeapFFI,
+    _millisecondsTimeout: c_int,
 ) -> HRESULT {
-    log!("WaitUntilConcurrentGCCompleteAsync");
     0 // S_OK
 }
 
-// Finalization
-extern "C" fn get_number_of_finalizable(this: *mut IGCHeapFFI) -> usize {
-    log!("GetNumberOfFinalizable");
-    0 // C# implementation returns 0
+extern "C" fn get_number_of_finalizable(_this: *mut IGCHeapFFI) -> usize {
+    0
 }
 
-extern "C" fn get_next_finalizable(this: *mut IGCHeapFFI) -> *mut Object {
-    log!("GetNextFinalizable");
-    std::ptr::null_mut() // C# implementation returns null
+extern "C" fn get_next_finalizable(_this: *mut IGCHeapFFI) -> *mut Object {
+    ptr::null_mut()
 }
 
-// BCL APIs
 extern "C" fn get_memory_info(
-    this: *mut IGCHeapFFI,
+    _this: *mut IGCHeapFFI,
     highMemLoadThresholdBytes: *mut u64,
     totalAvailableMemoryBytes: *mut u64,
     lastRecordedMemLoadBytes: *mut u64,
@@ -271,556 +283,371 @@ extern "C" fn get_memory_info(
     isConcurrent: *mut bool,
     genInfoRaw: *mut u64,
     pauseInfoRaw: *mut u64,
-    kind: c_int,
+    _kind: c_int,
 ) {
-    log!("GetMemoryInfo");
-
-    // Initialize all output parameters to zero/false as per C# implementation
+    // Initialize all output parameters to zero/false as per C# and C++ stubs
     unsafe {
-        if !highMemLoadThresholdBytes.is_null() {
-            *highMemLoadThresholdBytes = 0;
-        }
-        if !totalAvailableMemoryBytes.is_null() {
-            *totalAvailableMemoryBytes = 0;
-        }
-        if !lastRecordedMemLoadBytes.is_null() {
-            *lastRecordedMemLoadBytes = 0;
-        }
-        if !lastRecordedHeapSizeBytes.is_null() {
-            *lastRecordedHeapSizeBytes = 0;
-        }
-        if !lastRecordedFragmentationBytes.is_null() {
-            *lastRecordedFragmentationBytes = 0;
-        }
-        if !totalCommittedBytes.is_null() {
-            *totalCommittedBytes = 0;
-        }
-        if !promotedBytes.is_null() {
-            *promotedBytes = 0;
-        }
-        if !pinnedObjectCount.is_null() {
-            *pinnedObjectCount = 0;
-        }
-        if !finalizationPendingCount.is_null() {
-            *finalizationPendingCount = 0;
-        }
-        if !index.is_null() {
-            *index = 0;
-        }
-        if !generation.is_null() {
-            *generation = 0;
-        }
-        if !pauseTimePct.is_null() {
-            *pauseTimePct = 0;
-        }
-        if !isCompaction.is_null() {
-            *isCompaction = false;
-        }
-        if !isConcurrent.is_null() {
-            *isConcurrent = false;
-        }
-        if !genInfoRaw.is_null() {
-            *genInfoRaw = 0;
-        }
-        if !pauseInfoRaw.is_null() {
-            *pauseInfoRaw = 0;
-        }
+        if !highMemLoadThresholdBytes.is_null() { *highMemLoadThresholdBytes = 0; }
+        if !totalAvailableMemoryBytes.is_null() { *totalAvailableMemoryBytes = 0; }
+        if !lastRecordedMemLoadBytes.is_null() { *lastRecordedMemLoadBytes = 0; }
+        if !lastRecordedHeapSizeBytes.is_null() { *lastRecordedHeapSizeBytes = 0; }
+        if !lastRecordedFragmentationBytes.is_null() { *lastRecordedFragmentationBytes = 0; }
+        if !totalCommittedBytes.is_null() { *totalCommittedBytes = 0; }
+        if !promotedBytes.is_null() { *promotedBytes = 0; }
+        if !pinnedObjectCount.is_null() { *pinnedObjectCount = 0; }
+        if !finalizationPendingCount.is_null() { *finalizationPendingCount = 0; }
+        if !index.is_null() { *index = 0; }
+        if !generation.is_null() { *generation = 0; }
+        if !pauseTimePct.is_null() { *pauseTimePct = 0; }
+        if !isCompaction.is_null() { *isCompaction = false; }
+        if !isConcurrent.is_null() { *isConcurrent = false; }
+        if !genInfoRaw.is_null() { *genInfoRaw = 0; }
+        if !pauseInfoRaw.is_null() { *pauseInfoRaw = 0; }
     }
 }
 
-extern "C" fn get_memory_load(this: *mut IGCHeapFFI) -> u32 {
-    log!("GetMemoryLoad");
-    0 // C# implementation returns 0
+extern "C" fn get_memory_load(_this: *mut IGCHeapFFI) -> u32 {
+    0
 }
 
-extern "C" fn get_gc_latency_mode(this: *mut IGCHeapFFI) -> c_int {
-    log!("GetGcLatencyMode");
-    0 // C# implementation returns 0
+extern "C" fn get_gc_latency_mode(_this: *mut IGCHeapFFI) -> c_int {
+    0
 }
 
-extern "C" fn set_gc_latency_mode(this: *mut IGCHeapFFI, newLatencyMode: c_int) -> c_int {
-    log!("SetGcLatencyMode");
-    0 // C# implementation returns 0
+extern "C" fn set_gc_latency_mode(_this: *mut IGCHeapFFI, _newLatencyMode: c_int) -> c_int {
+    0
 }
 
-extern "C" fn get_loh_compaction_mode(this: *mut IGCHeapFFI) -> c_int {
-    log!("GetLOHCompactionMode");
-    0 // C# implementation returns 0
+extern "C" fn get_loh_compaction_mode(_this: *mut IGCHeapFFI) -> c_int {
+    0
 }
 
-extern "C" fn set_loh_compaction_mode(this: *mut IGCHeapFFI, newLOHCompactionMode: c_int) {
-    log!("SetLOHCompactionMode");
-}
+extern "C" fn set_loh_compaction_mode(_this: *mut IGCHeapFFI, _newLOHCompactionMode: c_int) {}
 
-extern "C" fn register_for_full_gc_notification(this: *mut IGCHeapFFI, gen: u32, count: u32) -> bool {
-    log!("RegisterForFullGCNotification");
+extern "C" fn register_for_full_gc_notification(_this: *mut IGCHeapFFI, _gen: u32, _count: u32) -> bool {
     false
 }
 
-extern "C" fn cancel_full_gc_notification(this: *mut IGCHeapFFI) -> bool {
-    log!("CancelFullGCNotification");
+extern "C" fn cancel_full_gc_notification(_this: *mut IGCHeapFFI) -> bool {
     false
 }
 
 
 extern "C" fn wait_for_full_gc_approach(
-    this: *mut IGCHeapFFI,
-    millisecondsTimeout: c_int,
+    _this: *mut IGCHeapFFI,
+    _millisecondsTimeout: c_int,
 ) -> c_int {
-    log!("WaitForFullGCApproach");
     0
 }
 
 extern "C" fn wait_for_full_gc_complete(
-    this: *mut IGCHeapFFI,
-    millisecondsTimeout: c_int,
+    _this: *mut IGCHeapFFI,
+    _millisecondsTimeout: c_int,
 ) -> c_int {
-    log!("WaitForFullGCComplete");
     0
 }
 
-extern "C" fn which_generation(this: *mut IGCHeapFFI, obj: *mut Object) -> c_uint {
-    log!("which_generation");
+extern "C" fn which_generation(_this: *mut IGCHeapFFI, _obj: *mut Object) -> c_uint {
     0
 }
 
 extern "C" fn collection_count(
-    this: *mut IGCHeapFFI,
-    generation: c_int,
-    get_bgc_fgc_coutn: c_int,
+    _this: *mut IGCHeapFFI,
+    _generation: c_int,
+    _get_bgc_fgc_coutn: c_int,
 ) -> c_int {
-    log!("collection_count");
     0
 }
 
 extern "C" fn start_no_gc_region(
-    this: *mut IGCHeapFFI,
-    totalSize: u64,
-    lohSizeKnown: bool,
-    lohSize: u64,
-    disallowFullBlockingGC: bool,
+    _this: *mut IGCHeapFFI,
+    _totalSize: u64,
+    _lohSizeKnown: bool,
+    _lohSize: u64,
+    _disallowFullBlockingGC: bool,
 ) -> c_int {
-    log!("start_no_gc_region");
     0
 }
 
-extern "C" fn end_no_gc_region(this: *mut IGCHeapFFI) -> c_int {
-    log!("end_no_gc_region");
+extern "C" fn end_no_gc_region(_this: *mut IGCHeapFFI) -> c_int {
     0
 }
 
-extern "C" fn get_total_bytes_in_use(this: *mut IGCHeapFFI) -> usize {
-    log!("get_total_bytes_in_use");
+extern "C" fn get_total_bytes_in_use(_this: *mut IGCHeapFFI) -> usize {
     0
 }
 
-extern "C" fn get_total_allocated_bytes(this: *mut IGCHeapFFI) -> u64 {
-    log!("get_total_allocated_bytes");
+extern "C" fn get_total_allocated_bytes(_this: *mut IGCHeapFFI) -> u64 {
     0
 }
 
-extern "C" fn garbage_collect(
-    this: *mut IGCHeapFFI,
-    generation: c_int,
-    low_memory_p: bool,
-    mode: c_int,
-) -> HRESULT {
-    log!("garbage_collect");
-    0
-}
-
-extern "C" fn get_max_generation(this: *mut IGCHeapFFI) -> c_uint {
-    log!("GetMaxGeneration");
-    2 // C# returns 2, representing generations 0, 1, and 2
-}
-
-extern "C" fn set_finalization_run(this: *mut IGCHeapFFI, obj: *mut Object) {
-    log!("set_finalization_run");
-}
+extern "C" fn set_finalization_run(_this: *mut IGCHeapFFI, _obj: *mut Object) {}
 
 extern "C" fn register_for_finalization(
-    this: *mut IGCHeapFFI,
-    gen: c_int,
-    obj: *mut Object,
+    _this: *mut IGCHeapFFI,
+    _gen: c_int,
+    _obj: *mut Object,
 ) -> bool {
-    log!("RegisterForFinalization");
     false
 }
 
-extern "C" fn get_last_gc_percent_time_in_gc(this: *mut IGCHeapFFI) -> c_int {
-    log!("get_last_gc_percent_time_in_gc");
+extern "C" fn get_last_gc_percent_time_in_gc(_this: *mut IGCHeapFFI) -> c_int {
     0
 }
 
-extern "C" fn get_last_gc_generation_size(this: *mut IGCHeapFFI, gen: c_int) -> usize {
-    log!("get_last_gc_generation_size");
+extern "C" fn get_last_gc_generation_size(_this: *mut IGCHeapFFI, _gen: c_int) -> usize {
     0
 }
 
-// Misc VM routines
-extern "C" fn initialize(this: *mut IGCHeapFFI) -> HRESULT {
-    log!("Initialize");
-    0
-}
-
-extern "C" fn is_promoted(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
-    log!("is_promoted");
+extern "C" fn is_promoted(_this: *mut IGCHeapFFI, _object: *mut Object) -> bool {
     false
 }
 
-#[no_mangle]
-extern "C" fn is_heap_pointer(
-    this: *mut IGCHeapFFI,
-    object: *mut c_void,
-    small_heap_only: bool,
-) -> bool {
-    log!("is_heap_pointer");
-    !object.is_null()
-}
-
-extern "C" fn get_condemned_generation(this: *mut IGCHeapFFI) -> c_uint {
-    log!("GetCondemnedGeneration");
+extern "C" fn get_condemned_generation(_this: *mut IGCHeapFFI) -> c_uint {
     0
 }
 
-extern "C" fn is_gc_in_progress_helper(this: *mut IGCHeapFFI, bConsiderGCStart: bool) -> bool {
-    log!("IsGCInProgressHelper");
+extern "C" fn is_gc_in_progress_helper(_this: *mut IGCHeapFFI, _bConsiderGCStart: bool) -> bool {
     false
 }
 
-extern "C" fn get_gc_count(this: *mut IGCHeapFFI) -> c_uint {
-    log!("GetGcCount");
+extern "C" fn get_gc_count(_this: *mut IGCHeapFFI) -> c_uint {
     0
 }
 
 extern "C" fn is_thread_using_allocation_context_heap(
-    this: *mut IGCHeapFFI,
-    acontext: *mut gc_alloc_context,
-    thread_number: c_int,
+    _this: *mut IGCHeapFFI,
+    _acontext: *mut gc_alloc_context,
+    _thread_number: c_int,
 ) -> bool {
-    log!("IsThreadUsingAllocationContextHeap");
     false
 }
 
-extern "C" fn is_ephemeral(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
-    log!("IsEphemeral");
+extern "C" fn is_ephemeral(_this: *mut IGCHeapFFI, _object: *mut Object) -> bool {
     false
 }
 
-extern "C" fn wait_until_gc_complete(this: *mut IGCHeapFFI, bConsiderGCStart: bool) -> u32 {
-    log!("WaitUntilGCComplete");
+extern "C" fn wait_until_gc_complete(_this: *mut IGCHeapFFI, _bConsiderGCStart: bool) -> u32 {
     0
 }
 
 extern "C" fn fix_alloc_context(
-    this: *mut IGCHeapFFI,
-    acontext: *mut gc_alloc_context,
-    arg: *mut c_void,
-    heap: *mut c_void,
-) {
-    log!("FixAllocContext");
-}
+    _this: *mut IGCHeapFFI,
+    _acontext: *mut gc_alloc_context,
+    _arg: *mut c_void,
+    _heap: *mut c_void,
+) {}
 
-extern "C" fn get_current_obj_size(this: *mut IGCHeapFFI) -> usize {
-    log!("GetCurrentObjSize");
+extern "C" fn get_current_obj_size(_this: *mut IGCHeapFFI) -> usize {
     0
 }
 
-extern "C" fn set_gc_in_progress(this: *mut IGCHeapFFI, fInProgress: bool) {
-    log!("SetGCInProgress");
-}
+extern "C" fn set_gc_in_progress(_this: *mut IGCHeapFFI, _fInProgress: bool) {}
 
-extern "C" fn runtime_structures_valid(this: *mut IGCHeapFFI) -> bool {
-    log!("RuntimeStructuresValid");
+extern "C" fn runtime_structures_valid(_this: *mut IGCHeapFFI) -> bool {
     true
 }
 
-extern "C" fn set_suspension_pending(this: *mut IGCHeapFFI, fSuspensionPending: bool) {
-    log!("SetSuspensionPending");
-}
+extern "C" fn set_suspension_pending(_this: *mut IGCHeapFFI, _fSuspensionPending: bool) {}
 
 extern "C" fn set_yield_processor_scaling_factor(
-    this: *mut IGCHeapFFI,
-    yieldProcessorScalingFactor: c_float,
-) {
-    log!("SetYieldProcessorScalingFactor");
-}
+    _this: *mut IGCHeapFFI,
+    _yieldProcessorScalingFactor: c_float,
+) {}
 
-extern "C" fn shutdown(this: *mut IGCHeapFFI) {
-    log!("Shutdown");
-}
+extern "C" fn shutdown(_this: *mut IGCHeapFFI) {}
 
-// Add/RemoveMemoryPressure support
-extern "C" fn get_last_gc_start_time(this: *mut IGCHeapFFI, generation: c_int) -> usize {
-    log!("GetLastGCStartTime");
+extern "C" fn get_last_gc_start_time(_this: *mut IGCHeapFFI, _generation: c_int) -> usize {
     0
 }
 
-extern "C" fn get_last_gc_duration(this: *mut IGCHeapFFI, generation: c_int) -> usize {
-    log!("GetLastGCDuration");
+extern "C" fn get_last_gc_duration(_this: *mut IGCHeapFFI, _generation: c_int) -> usize {
     0
 }
 
-extern "C" fn get_now(this: *mut IGCHeapFFI) -> usize {
-    log!("GetNow");
+extern "C" fn get_now(_this: *mut IGCHeapFFI) -> usize {
     0
 }
 
-// Allocation
-extern "C" fn alloc(
-    this: *mut IGCHeapFFI,
-    acontext: *mut gc_alloc_context,
-    size: usize,
-    flags: u32,
-) -> *mut Object {
-    log!("Alloc");
-    null_mut()
-}
+extern "C" fn publish_object(_this: *mut IGCHeapFFI, _obj: *mut u8) {}
 
-extern "C" fn publish_object(this: *mut IGCHeapFFI, obj: *mut u8) {
-    log!("PublishObject: {:#x}", obj as usize);
-}
+extern "C" fn set_wait_for_gc_event(_this: *mut IGCHeapFFI) {}
 
-extern "C" fn set_wait_for_gc_event(this: *mut IGCHeapFFI) {
-    log!("SetWaitForGCEvent");
-}
+extern "C" fn reset_wait_for_gc_event(_this: *mut IGCHeapFFI) {}
 
-extern "C" fn reset_wait_for_gc_event(this: *mut IGCHeapFFI) {
-    log!("ResetWaitForGCEvent");
-}
-
-// Heap Verification
-extern "C" fn is_large_object(this: *mut IGCHeapFFI, pObj: *mut Object) -> bool {
-    log!("IsLargeObject");
+extern "C" fn is_large_object(_this: *mut IGCHeapFFI, _pObj: *mut Object) -> bool {
     false
 }
 
-extern "C" fn validate_object_member(this: *mut IGCHeapFFI, obj: *mut Object) {
-    log!("ValidateObjectMember");
-}
+extern "C" fn validate_object_member(_this: *mut IGCHeapFFI, _obj: *mut Object) {}
 
-extern "C" fn next_obj(this: *mut IGCHeapFFI, object: *mut Object) -> *mut Object {
-    log!("NextObj");
+extern "C" fn next_obj(_this: *mut IGCHeapFFI, _object: *mut Object) -> *mut Object {
     null_mut()
 }
 
 extern "C" fn get_containing_object(
-    this: *mut IGCHeapFFI,
-    pInteriorPtr: *mut c_void,
-    fCollectedGenOnly: bool,
+    _this: *mut IGCHeapFFI,
+    _pInteriorPtr: *mut c_void,
+    _fCollectedGenOnly: bool,
 ) -> *mut Object {
-    log!("GetContainingObject");
     null_mut()
 }
 
-// Profiling
 extern "C" fn diag_walk_object(
-    this: *mut IGCHeapFFI,
-    obj: *mut Object,
-    fn_: walk_fn,
-    context: *mut c_void,
-) {
-    log!("DiagWalkObject");
-}
+    _this: *mut IGCHeapFFI,
+    _obj: *mut Object,
+    _fn: walk_fn,
+    _context: *mut c_void,
+) {}
 
 extern "C" fn diag_walk_object2(
-    this: *mut IGCHeapFFI,
-    obj: *mut Object,
-    fn_: walk_fn2,
-    context: *mut c_void,
-) {
-    log!("DiagWalkObject2");
-}
+    _this: *mut IGCHeapFFI,
+    _obj: *mut Object,
+    _fn: walk_fn2,
+    _context: *mut c_void,
+) {}
 
 extern "C" fn diag_walk_heap(
-    this: *mut IGCHeapFFI,
-    fn_: walk_fn,
-    context: *mut c_void,
-    gen_number: c_int,
-    walk_large_object_heap_p: bool,
-) {
-    log!("DiagWalkHeap");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: walk_fn,
+    _context: *mut c_void,
+    _gen_number: c_int,
+    _walk_large_object_heap_p: bool,
+) {}
 
 extern "C" fn diag_walk_survivors_with_type(
-    this: *mut IGCHeapFFI,
-    gc_context: *mut c_void,
-    fn_: record_surv_fn,
-    diag_context: *mut c_void,
-    type_: walk_surv_type,
-    gen_number: c_int,
-) {
-    log!("DiagWalkSurvivorsWithType");
-}
+    _this: *mut IGCHeapFFI,
+    _gc_context: *mut c_void,
+    _fn: record_surv_fn,
+    _diag_context: *mut c_void,
+    _type: walk_surv_type,
+    _gen_number: c_int,
+) {}
 
 extern "C" fn diag_walk_finalize_queue(
-    this: *mut IGCHeapFFI,
-    gc_context: *mut c_void,
-    fn_: fq_walk_fn,
-) {
-    log!("DiagWalkFinalizeQueue");
-}
+    _this: *mut IGCHeapFFI,
+    _gc_context: *mut c_void,
+    _fn: fq_walk_fn,
+) {}
 
 extern "C" fn diag_scan_finalize_queue(
-    this: *mut IGCHeapFFI,
-    fn_: fq_scan_fn,
-    context: *mut crate::interfaces::ScanContext,
-) {
-    log!("DiagScanFinalizeQueue");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: fq_scan_fn,
+    _context: *mut crate::interfaces::ScanContext,
+) {}
 
 extern "C" fn diag_scan_handles(
-    this: *mut IGCHeapFFI,
-    fn_: handle_scan_fn,
-    gen_number: c_int,
-    context: *mut crate::interfaces::ScanContext,
-) {
-    log!("DiagScanHandles");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: handle_scan_fn,
+    _gen_number: c_int,
+    _context: *mut crate::interfaces::ScanContext,
+) {}
 
 extern "C" fn diag_scan_dependent_handles(
-    this: *mut IGCHeapFFI,
-    fn_: handle_scan_fn,
-    gen_number: c_int,
-    context: *mut crate::interfaces::ScanContext,
-) {
-    log!("DiagScanDependentHandles");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: handle_scan_fn,
+    _gen_number: c_int,
+    _context: *mut crate::interfaces::ScanContext,
+) {}
 
 extern "C" fn diag_descr_generations(
-    this: *mut IGCHeapFFI,
-    fn_: gen_walk_fn,
-    context: *mut c_void,
-) {
-    log!("DiagDescrGenerations");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: gen_walk_fn,
+    _context: *mut c_void,
+) {}
 
-extern "C" fn diag_trace_gc_segments(this: *mut IGCHeapFFI) {
-    log!("DiagTraceGCSegments");
-}
+extern "C" fn diag_trace_gc_segments(_this: *mut IGCHeapFFI) {}
 
-extern "C" fn diag_get_gc_settings(this: *mut IGCHeapFFI, settings: *mut EtwGCSettingsInfo) {
-    log!("DiagGetGCSettings");
-}
+extern "C" fn diag_get_gc_settings(_this: *mut IGCHeapFFI, _settings: *mut EtwGCSettingsInfo) {}
 
-// GC Stress
-extern "C" fn stress_heap(this: *mut IGCHeapFFI, acontext: *mut gc_alloc_context) -> bool {
-    log!("StressHeap");
+extern "C" fn stress_heap(_this: *mut IGCHeapFFI, _acontext: *mut gc_alloc_context) -> bool {
     false
 }
 
-// Frozen Objects
 extern "C" fn register_frozen_segment(
-    this: *mut IGCHeapFFI,
-    pseginfo: *mut segment_info,
+    _this: *mut IGCHeapFFI,
+    _pseginfo: *mut segment_info,
 ) -> segment_handle {
-    log!("RegisterFrozenSegment");
     null_mut()
 }
 
-extern "C" fn unregister_frozen_segment(this: *mut IGCHeapFFI, seg: segment_handle) {
-    log!("UnregisterFrozenSegment");
-}
+extern "C" fn unregister_frozen_segment(_this: *mut IGCHeapFFI, _seg: segment_handle) {}
 
-extern "C" fn is_in_frozen_segment(this: *mut IGCHeapFFI, object: *mut Object) -> bool {
-    log!("IsInFrozenSegment");
+extern "C" fn is_in_frozen_segment(_this: *mut IGCHeapFFI, _object: *mut Object) -> bool {
     false
 }
 
-// Event Control
 #[no_mangle]
-extern "C" fn control_events(this: *mut IGCHeapFFI, keyword: GCEventKeyword, level: GCEventLevel) {
-    log!("control_events")
-}
+extern "C" fn control_events(_this: *mut IGCHeapFFI, _keyword: GCEventKeyword, _level: GCEventLevel) {}
 
 #[no_mangle]
 extern "C" fn control_private_events(
-    this: *mut IGCHeapFFI,
-    keyword: GCEventKeyword,
-    level: GCEventLevel,
-) {
-    log!("calling control_private_events")
-}
+    _this: *mut IGCHeapFFI,
+    _keyword: GCEventKeyword,
+    _level: GCEventLevel,
+) {}
 
 extern "C" fn get_generation_with_range(
-    this: *mut IGCHeapFFI,
-    object: *mut Object,
-    ppStart: *mut *mut u8,
-    ppAllocated: *mut *mut u8,
-    ppReserved: *mut *mut u8,
+    _this: *mut IGCHeapFFI,
+    _object: *mut Object,
+    _ppStart: *mut *mut u8,
+    _ppAllocated: *mut *mut u8,
+    _ppReserved: *mut *mut u8,
 ) -> c_uint {
-    log!("GetGenerationWithRange");
     0
 }
 
-// New additions
-extern "C" fn get_total_pause_duration(this: *mut IGCHeapFFI) -> i64 {
-    log!("GetTotalPauseDuration");
+extern "C" fn get_total_pause_duration(_this: *mut IGCHeapFFI) -> i64 {
     0
 }
 extern "C" fn enum_configuration_values(
-    this: *mut IGCHeapFFI,
-    context: *mut c_void,
-    configurationValueFunc: ConfigurationValueFunc,
-) {
-    log!("EnumConfigurationValues");
-}
+    _this: *mut IGCHeapFFI,
+    _context: *mut c_void,
+    _configurationValueFunc: ConfigurationValueFunc,
+) {}
 extern "C" fn update_frozen_segment(
-    this: *mut IGCHeapFFI,
-    seg: segment_handle,
-    allocated: *mut u8,
-    committed: *mut u8,
-) {
-    log!("UpdateFrozenSegment");
-}
-extern "C" fn refresh_memory_limit(this: *mut IGCHeapFFI) -> c_int {
-    log!("RefreshMemoryLimit");
+    _this: *mut IGCHeapFFI,
+    _seg: segment_handle,
+    _allocated: *mut u8,
+    _committed: *mut u8,
+) {}
+extern "C" fn refresh_memory_limit(_this: *mut IGCHeapFFI) -> c_int {
     0
 }
 
 extern "C" fn enables_no_gc_region_callback_status(
-    this: *mut IGCHeapFFI,
-    callback: *mut NoGCRegionCallbackFinalizerWorkItem,
-    callback_threshold: u64,
+    _this: *mut IGCHeapFFI,
+    _callback: *mut NoGCRegionCallbackFinalizerWorkItem,
+    _callback_threshold: u64,
 ) -> enable_no_gc_region_callback_status {
-    log!("EnablesNoGCRegionCallbackStatus");
     enable_no_gc_region_callback_status::succeed
 }
 
-extern "C" fn get_extra_work_for_finalization(this: *mut IGCHeapFFI) -> *mut FinalizerWorkItem {
-    log!("GetExtraWorkForFinalization");
-    std::ptr::null_mut()
+extern "C" fn get_extra_work_for_finalization(_this: *mut IGCHeapFFI) -> *mut FinalizerWorkItem {
+    ptr::null_mut()
 }
-extern "C" fn get_generation_budget(this: *mut IGCHeapFFI, generation: c_int) -> u64 {
-    log!("GetGenerationBudget");
+extern "C" fn get_generation_budget(_this: *mut IGCHeapFFI, _generation: c_int) -> u64 {
     0
 }
-extern "C" fn get_loh_threshold(this: *mut IGCHeapFFI) -> usize {
-    log!("GetLOHThreshold");
+extern "C" fn get_loh_threshold(_this: *mut IGCHeapFFI) -> usize {
     0
 }
 
 extern "C" fn diag_walk_heap_with_ac_handling(
-    this: *mut IGCHeapFFI,
-    fn_: walk_fn,
-    context: *mut c_void,
-    gen_number: c_int,
-    walk_large_object_heap_p: bool,
-) {
-    log!("DiagWalkHeapWithACHandling");
-}
+    _this: *mut IGCHeapFFI,
+    _fn: walk_fn,
+    _context: *mut c_void,
+    _gen_number: c_int,
+    _walk_large_object_heap_p: bool,
+) {}
 
-// Create a static VTable. All unimplemented methods will panic.
-// A production GC would need to implement more of these.
 static GCHEAP_VTABLE: IGCHeapVTable = IGCHeapVTable {
     Initialize: heap_initialize,
     Alloc: heap_alloc,
     GarbageCollect: heap_garbage_collect,
-
-    // Most other methods can be no-ops or return default values for this simple GC.
     IsValidSegmentSize: is_valid_segment_size,
     IsValidGen0MaxSize: is_valid_gen0_max_size,
-    GetValidSegmentSize: get_valid_segment_size, // 1MB
+    GetValidSegmentSize: get_valid_segment_size,
     SetReservedVMLimit: set_reserved_vm_limit,
     WaitUntilConcurrentGCComplete: wait_until_concurrent_gc_complete,
     IsConcurrentGCInProgress: is_concurrent_gc_in_progress,
@@ -830,8 +657,8 @@ static GCHEAP_VTABLE: IGCHeapVTable = IGCHeapVTable {
     GetMaxGeneration: get_max_generation,
     WhichGeneration: which_generation,
     CollectionCount: collection_count,
-    IsPromoted: is_promoted,        // Nothing is ever promoted
-    IsHeapPointer: is_heap_pointer, // A lie, but good enough
+    IsPromoted: is_promoted,
+    IsHeapPointer: is_heap_pointer,
     GetGcCount: get_gc_count,
     WaitUntilConcurrentGCCompleteAsync: wait_until_concurrent_gc_complete_async,
     GetNumberOfFinalizable: get_number_of_finalizable,

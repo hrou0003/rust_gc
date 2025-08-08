@@ -1,16 +1,19 @@
 use crate::gc_handle_store::MyGCHandleStore;
 use crate::interfaces::{
-    IGCHandleManagerVTable, HandleType, IGCHandleManagerFFI,
-    IGCHandleStoreFFI, Object, OBJECTHANDLE, HANDLESCANPROC,
+    HandleType, IGCHandleManagerFFI, IGCHandleManagerVTable, IGCHandleStoreFFI, Object,
+    OBJECTHANDLE, HANDLESCANPROC,
 };
 use std::ffi::c_void;
-use std::mem::forget;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+// Global handle store, mimicking the C++ implementation's g_gcGlobalHandleStore.
+static mut GLOBAL_HANDLE_STORE: *mut MyGCHandleStore = ptr::null_mut();
 
 #[repr(C)]
 pub struct MyGCHandleManager {
     pub ffi: IGCHandleManagerFFI,
-    pub store: Box<MyGCHandleStore>,
+    // The manager no longer owns the store directly; it's accessed via the global pointer.
 }
 
 impl MyGCHandleManager {
@@ -19,172 +22,187 @@ impl MyGCHandleManager {
             ffi: IGCHandleManagerFFI {
                 vtable: &GCHANDLEMANAGER_VTABLE,
             },
-            store: Box::new(MyGCHandleStore::new()),
         }
-    }
-    
-    pub fn create_global_handle_of_type(
-        &mut self,
-        object: *mut Object,
-        type_: HandleType,
-    ) -> Result<OBJECTHANDLE, &'static str> {
-        Ok(self.store.create_handle_of_type_impl(object, type_))
     }
 }
 
 // --- IGCHandleManager VTable ---
 
-extern "C" fn mgr_initialize(this: *mut IGCHandleManagerFFI) -> bool {
+extern "C" fn mgr_initialize(_this: *mut IGCHandleManagerFFI) -> bool {
+    // Allocate the global handle store, mirroring the C++ Initialize method.
+    unsafe {
+        if GLOBAL_HANDLE_STORE.is_null() {
+            let store = Box::new(MyGCHandleStore::new());
+            GLOBAL_HANDLE_STORE = Box::into_raw(store);
+        }
+    }
     true
 }
-extern "C" fn mgr_shutdown(this: *mut IGCHandleManagerFFI) { /* no-op */
-}
-extern "C" fn mgr_get_global_handle_store(
-    this: *mut IGCHandleManagerFFI,
-) -> *mut IGCHandleStoreFFI {
-    let manager = unsafe { &mut *(this as *mut MyGCHandleManager) };
-    &mut manager.store.ffi
+
+extern "C" fn mgr_shutdown(_this: *mut IGCHandleManagerFFI) {
+    // In a real application, we would deallocate GLOBAL_HANDLE_STORE here.
+    // The C++ version is also a no-op, so we match that.
 }
 
-extern "C" fn mgr_create_handle_store(this: *mut IGCHandleManagerFFI) -> *mut IGCHandleStoreFFI {
-    return std::ptr::null_mut();
+#[no_mangle]
+extern "C" fn mgr_get_global_handle_store(
+    _this: *mut IGCHandleManagerFFI,
+) -> *mut IGCHandleStoreFFI {
+    unsafe {
+        // Return a pointer to the FFI interface of the global store.
+        if GLOBAL_HANDLE_STORE.is_null() {
+            return ptr::null_mut();
+        }
+        &mut (*GLOBAL_HANDLE_STORE).ffi
+    }
+}
+
+extern "C" fn mgr_create_handle_store(_this: *mut IGCHandleManagerFFI) -> *mut IGCHandleStoreFFI {
+    // Matches C++: return nullptr
+    ptr::null_mut()
 }
 
 extern "C" fn mgr_destroy_handle_store(
-    this: *mut IGCHandleManagerFFI,
-    store: *mut IGCHandleStoreFFI,
+    _this: *mut IGCHandleManagerFFI,
+    _store: *mut IGCHandleStoreFFI,
 ) {
+    // Matches C++: no-op
 }
 
 #[no_mangle]
 extern "C" fn mgr_create_global_handle_of_type(
-    this: *mut IGCHandleManagerFFI,
+    _this: *mut IGCHandleManagerFFI,
     object: *mut Object,
     type_: HandleType,
 ) -> OBJECTHANDLE {
-
-    let manager = unsafe { &mut *(this as *mut MyGCHandleManager) };
-
-    match manager.create_global_handle_of_type(object, type_) {
-        Ok(handle) => {
-            log!("Created handle {:?} for object {:?}", handle, object);
-            handle
+    // Directly call the global store's creation method, matching C++.
+    unsafe {
+        if GLOBAL_HANDLE_STORE.is_null() {
+            return ptr::null_mut();
         }
-        Err(e) => {
-            log!("Failed to create handle for object {:?}: {}", object, e);
-            std::ptr::null_mut() as OBJECTHANDLE
-        }
+        (*GLOBAL_HANDLE_STORE).create_handle_of_type_impl(object, type_)
     }
 }
 
 extern "C" fn mgr_create_duplicate_handle(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
 ) -> OBJECTHANDLE {
-    todo!()
+    // Matches C++: return OBJECTHANDLE()
+    ptr::null_mut()
 }
+
 extern "C" fn mgr_destroy_handle_of_type(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-    type_: HandleType,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
+    _type_: HandleType,
 ) {
-    todo!()
+    // Matches C++: no-op
 }
+
 extern "C" fn mgr_destroy_handle_of_unknown_type(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
 ) {
-    todo!()
+    // Matches C++: no-op
 }
+
 extern "C" fn mgr_set_extra_info_for_handle(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-    type_: HandleType,
-    pExtraInfo: *mut c_void,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
+    _type_: HandleType,
+    _pExtraInfo: *mut c_void,
 ) {
-    todo!()
+    // Matches C++: no-op
 }
+
 extern "C" fn mgr_get_extra_info_from_handle(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
 ) -> *mut c_void {
-    todo!()
+    // Matches C++: return nullptr
+    ptr::null_mut()
 }
+
 extern "C" fn mgr_store_object_in_handle(
-    this: *mut IGCHandleManagerFFI,
+    _this: *mut IGCHandleManagerFFI,
     handle: OBJECTHANDLE,
     object: *mut Object,
 ) {
-    todo!()
+    // Direct pointer write, matching C++.
+    unsafe {
+        *(handle as *mut *mut Object) = object;
+    }
 }
+
 extern "C" fn mgr_store_object_in_handle_if_null(
-    this: *mut IGCHandleManagerFFI,
+    _this: *mut IGCHandleManagerFFI,
     handle: OBJECTHANDLE,
     object: *mut Object,
 ) -> bool {
-    todo!()
+    // Matches the non-thread-safe C++ implementation.
+    unsafe {
+        let handle_ptr = handle as *mut *mut Object;
+        if (*handle_ptr).is_null() {
+            *handle_ptr = object;
+            return true;
+        }
+    }
+    false
 }
 
 extern "C" fn mgr_set_dependent_handle_secondary(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-    object: *mut Object,
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
+    _object: *mut Object,
 ) {
-    todo!()
-}
-extern "C" fn mgr_get_dependent_handle_secondary(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-) -> *mut Object {
-    todo!()
-}
-extern "C" fn mgr_interlocked_compare_exchange_object_in_handle(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-    object: *mut Object,
-    comparandObject: *mut Object,
-) -> *mut Object {
-    todo!()
-}
-extern "C" fn mgr_handle_fetch_type(
-    this: *mut IGCHandleManagerFFI,
-    handle: OBJECTHANDLE,
-) -> HandleType {
-    todo!()
-}
-extern "C" fn mgr_trace_ref_counted_handles(
-    this: *mut IGCHandleManagerFFI,
-    callback: HANDLESCANPROC,
-    param1: usize,
-    param2: usize,
-) {
-    todo!()
+    // Matches C++: no-op
 }
 
-extern "C" fn mgr_cas_object_in_handle(
-    this: *mut IGCHandleManagerFFI,
+extern "C" fn mgr_get_dependent_handle_secondary(
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
+) -> *mut Object {
+    // Matches C++: return nullptr
+    ptr::null_mut()
+}
+
+extern "C" fn mgr_interlocked_compare_exchange_object_in_handle(
+    _this: *mut IGCHandleManagerFFI,
     handle: OBJECTHANDLE,
     object: *mut Object,
-    comparand: *mut Object,
+    comparand_object: *mut Object,
 ) -> *mut Object {
-    let handle_ptr = handle as *mut *mut Object; // Pointer to the 'object' field
-    let atomic_ptr = unsafe { &*(handle_ptr as *const AtomicIsize) };
-    let result = atomic_ptr.compare_exchange(
-        comparand as isize,
-        object as isize,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
-    match result {
-        Ok(v) => v as *mut Object,
-        Err(v) => v as *mut Object,
+    // Use AtomicPtr for a thread-safe implementation, which is an improvement
+    // over the non-thread-safe C++ stub.
+    let atomic_handle_ptr = handle as *mut AtomicPtr<Object>;
+    unsafe {
+        (*atomic_handle_ptr)
+            .compare_exchange(
+                comparand_object,
+                object,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .unwrap_or_else(|v| v) // Return the value, whether exchange happened or not
     }
 }
-extern "C" fn mgr_get_type(this: *mut IGCHandleManagerFFI, handle: OBJECTHANDLE) -> HandleType {
-    // Since we simplified to just store object pointers like C#,
-    // we can't easily determine type. Return a default.
-    log!("mgr_get_type called");
-    HandleType::STRONG // Default like C# might do
+
+extern "C" fn mgr_handle_fetch_type(
+    _this: *mut IGCHandleManagerFFI,
+    _handle: OBJECTHANDLE,
+) -> HandleType {
+    // Matches C++: return HandleType() which is equivalent to the default.
+    HandleType::default()
+}
+
+extern "C" fn mgr_trace_ref_counted_handles(
+    _this: *mut IGCHandleManagerFFI,
+    _callback: HANDLESCANPROC,
+    _param1: usize,
+    _param2: usize,
+) {
+    // Matches C++: no-op
 }
 
 static GCHANDLEMANAGER_VTABLE: IGCHandleManagerVTable = IGCHandleManagerVTable {
@@ -205,5 +223,5 @@ static GCHANDLEMANAGER_VTABLE: IGCHandleManagerVTable = IGCHandleManagerVTable {
     GetDependentHandleSecondary: mgr_get_dependent_handle_secondary,
     InterlockedCompareExchangeObjectInHandle: mgr_interlocked_compare_exchange_object_in_handle,
     HandleFetchType: mgr_handle_fetch_type,
-    TraceRefCountedHandles: mgr_trace_ref_counted_handles, // We only have one global store
+    TraceRefCountedHandles: mgr_trace_ref_counted_handles,
 };
