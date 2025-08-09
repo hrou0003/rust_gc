@@ -19,7 +19,8 @@ pub struct MyGCHeap {
     pub handle_manager: Box<MyGCHandleManager>,
     pub heap_start: *mut u8,
     pub next_alloc_ptr: *mut u8,
-    pub alloc_limit: *mut u8
+    pub alloc_limit: *mut u8,
+    frozen_segments: Vec<*mut u8>,
     // The heap state is managed entirely through the gc_alloc_context,
     // so no top-level heap pointers are needed here, matching the C++ ZeroGCHeap design.
 }
@@ -47,6 +48,7 @@ impl MyGCHeap {
             alloc_limit: 0 as *mut u8,
             next_alloc_ptr: 0 as *mut u8,
             heap_start: 0 as *mut u8,
+            frozen_segments: Vec::new()
         }
     }
 
@@ -70,6 +72,7 @@ impl MyGCHeap {
         self.heap_start = arena;
         self.next_alloc_ptr = arena;
         self.alloc_limit = unsafe { arena.add(HEAP_BYTES) };
+        debug_assert!(self.heap_start <= self.next_alloc_ptr, "heap_start must be below alloc_limit");
 
         // 2) Keep your current write-barrier initialization
         // (dummy card table and extreme bounds) as you already had.
@@ -146,7 +149,7 @@ impl MyGCHeap {
         acontext.alloc_ptr = self.next_alloc_ptr;
         acontext.alloc_limit = new_end;
         self.next_alloc_ptr = new_end;
-
+        debug_assert!(self.heap_start <= self.next_alloc_ptr, "heap_start must be below alloc_limit");
         // Allocate in the new slice
         let header_ptr = align_up(acontext.alloc_ptr, OBJ_HEADER_BYTES);
         let obj = unsafe { header_ptr.add(OBJ_HEADER_BYTES) as *mut Object };
@@ -206,7 +209,7 @@ extern "C" fn is_heap_pointer(
     object: *mut c_void,
     _small_heap_only: bool,
 ) -> bool {
-    if object.is_null() {
+    if object.is_null() && _small_heap_only {
         return false;
     }
     // Cast the FFI object back to your heap type
@@ -215,8 +218,9 @@ extern "C" fn is_heap_pointer(
     let ptr = object as *mut u8;
     // Return true only if the pointer is inside the managed heap arena
     let is_heap_pointer = unsafe { heap.heap_start <= ptr && ptr < heap.next_alloc_ptr };
-    log!("is_heap_pointer {:?}, {}", ptr, is_heap_pointer);
-    is_heap_pointer
+    debug_assert!(heap.heap_start < heap.next_alloc_ptr, "heap_start must be below alloc_limit");
+    log!("is_heap_pointer {:?}, start {:?}, end {:?}, {}", ptr, heap.heap_start, heap.next_alloc_ptr, is_heap_pointer);
+    is_heap_pointer || _small_heap_only
 }
 
 
@@ -565,27 +569,33 @@ extern "C" fn stress_heap(_this: *mut IGCHeapFFI, _acontext: *mut gc_alloc_conte
 }
 
 extern "C" fn register_frozen_segment(
-    _this: *mut IGCHeapFFI,
-    _pseginfo: *mut segment_info,
+    this: *mut IGCHeapFFI,
+    pseginfo: *mut segment_info,
 ) -> segment_handle {
-    null_mut()
+    log!("RegisterFrozenSegment");
+    pseginfo
 }
 
 extern "C" fn unregister_frozen_segment(_this: *mut IGCHeapFFI, _seg: segment_handle) {}
 
 extern "C" fn is_in_frozen_segment(_this: *mut IGCHeapFFI, _object: *mut Object) -> bool {
+    log!("IsInFrozenSegment");
     false
 }
 
 #[no_mangle]
-extern "C" fn control_events(_this: *mut IGCHeapFFI, _keyword: GCEventKeyword, _level: GCEventLevel) {}
+extern "C" fn control_events(_this: *mut IGCHeapFFI, _keyword: GCEventKeyword, _level: GCEventLevel) {
+    log!("ControlEvents");
+}
 
 #[no_mangle]
 extern "C" fn control_private_events(
     _this: *mut IGCHeapFFI,
     _keyword: GCEventKeyword,
     _level: GCEventLevel,
-) {}
+) {
+    log!("ControlPrivateEvents");
+}
 
 extern "C" fn get_generation_with_range(
     _this: *mut IGCHeapFFI,
@@ -594,24 +604,31 @@ extern "C" fn get_generation_with_range(
     _ppAllocated: *mut *mut u8,
     _ppReserved: *mut *mut u8,
 ) -> c_uint {
+    log!("GetGenerationWithRange");
     0
 }
 
 extern "C" fn get_total_pause_duration(_this: *mut IGCHeapFFI) -> i64 {
+    log!("GetTotalPauseDuration");
     0
 }
 extern "C" fn enum_configuration_values(
     _this: *mut IGCHeapFFI,
     _context: *mut c_void,
     _configurationValueFunc: ConfigurationValueFunc,
-) {}
+) {
+    log!("EnumConfigurationValues");
+}
 extern "C" fn update_frozen_segment(
     _this: *mut IGCHeapFFI,
     _seg: segment_handle,
     _allocated: *mut u8,
     _committed: *mut u8,
-) {}
+) {
+    log!("UpdateFrozenSegment");
+}
 extern "C" fn refresh_memory_limit(_this: *mut IGCHeapFFI) -> c_int {
+    log!("RefreshMemoryLimit");
     0
 }
 
@@ -620,16 +637,20 @@ extern "C" fn enables_no_gc_region_callback_status(
     _callback: *mut NoGCRegionCallbackFinalizerWorkItem,
     _callback_threshold: u64,
 ) -> enable_no_gc_region_callback_status {
+    log!("EnableNoGcRegionCallbackStatus");
     enable_no_gc_region_callback_status::succeed
 }
 
 extern "C" fn get_extra_work_for_finalization(_this: *mut IGCHeapFFI) -> *mut FinalizerWorkItem {
+    log!("GetExtraWorkForFinalization");
     ptr::null_mut()
 }
 extern "C" fn get_generation_budget(_this: *mut IGCHeapFFI, _generation: c_int) -> u64 {
+    log!("GetGenerationBudget");
     0
 }
 extern "C" fn get_loh_threshold(_this: *mut IGCHeapFFI) -> usize {
+    log!("GetLohThreshold");
     0
 }
 

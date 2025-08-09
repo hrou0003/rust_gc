@@ -76,7 +76,7 @@ pub struct GcDacVars {
 }
 
 // --- Pointer Type Aliases ---
-pub type segment_handle = *mut gc_heap_segment_stub;
+pub type segment_handle = *mut segment_info;
 pub type OBJECTHANDLE = *mut OBJECTHANDLE__;
 pub type PTR_PTR_Object = *mut *mut Object;
 pub type PTR_UNCHECKED_OBJECTREF = *mut Object;
@@ -428,7 +428,7 @@ pub struct gc_alloc_context {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct segment_info {
-    pub pvMem: *mut c_void,
+    pub pvMem: *mut u8,
     pub ibFirstObject: usize,
     pub ibAllocated: usize,
     pub ibCommit: usize,
