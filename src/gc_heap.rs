@@ -6,7 +6,7 @@ use crate::interfaces::{
     Object, WriteBarrierOp, WriteBarrierParameters, fq_scan_fn, fq_walk_fn, gen_walk_fn,
     handle_scan_fn, record_surv_fn, segment_handle, segment_info,
 };
-use std::alloc::{alloc, alloc_zeroed, Layout};
+use std::alloc::{alloc, Layout};
 use std::ffi::{c_float, c_uint, c_void};
 use std::os::raw::c_int;
 use std::ptr;
