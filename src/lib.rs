@@ -10,10 +10,10 @@ macro_rules! log {
 }
 
 // Import our FFI definitions
-mod interfaces;
-mod gc_heap;
 mod gc_handle_manager;
 mod gc_handle_store;
+mod gc_heap;
+mod interfaces;
 
 use interfaces::*;
 
@@ -35,8 +35,10 @@ pub struct IGCToCLRVTable {
         sc: *mut ScanContext,
     ),
     pub GcStartWork: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, max_gen: c_int),
-    pub BeforeGcScanRoots: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, is_bgc: bool, is_concurrent: bool),
-    pub AfterGcScanRoots: extern "C" fn(this: *mut IGCToCLR, condemned: c_int, max_gen: c_int, sc: *mut ScanContext),
+    pub BeforeGcScanRoots:
+        extern "C" fn(this: *mut IGCToCLR, condemned: c_int, is_bgc: bool, is_concurrent: bool),
+    pub AfterGcScanRoots:
+        extern "C" fn(this: *mut IGCToCLR, condemned: c_int, max_gen: c_int, sc: *mut ScanContext),
     pub GcDone: extern "C" fn(this: *mut IGCToCLR, condemned: c_int),
     pub RefCountedHandleCallbacks: extern "C" fn(this: *mut IGCToCLR, pObject: *mut Object) -> bool,
     pub SyncBlockCacheWeakPtrScan:
@@ -49,9 +51,13 @@ pub struct IGCToCLRVTable {
     pub DisablePreemptiveGC: extern "C" fn(this: *mut IGCToCLR),
     pub GetThread: extern "C" fn(this: *mut IGCToCLR) -> *mut Thread,
     pub GetAllocContext: extern "C" fn(this: *mut IGCToCLR) -> *mut gc_alloc_context,
-    pub GcEnumAllocContexts:
-        extern "C" fn(this: *mut IGCToCLR, fn_ptr: enum_alloc_context_func, param: *mut std::ffi::c_void),
-    pub GetLoaderAllocatorObjectForGC: extern "C" fn(this: *mut IGCToCLR, pObject: *mut Object) -> *mut u8,
+    pub GcEnumAllocContexts: extern "C" fn(
+        this: *mut IGCToCLR,
+        fn_ptr: enum_alloc_context_func,
+        param: *mut std::ffi::c_void,
+    ),
+    pub GetLoaderAllocatorObjectForGC:
+        extern "C" fn(this: *mut IGCToCLR, pObject: *mut Object) -> *mut u8,
     pub CreateThread: extern "C" fn(
         this: *mut IGCToCLR,
         threadStart: extern "C" fn(*mut std::ffi::c_void),
@@ -61,10 +67,19 @@ pub struct IGCToCLRVTable {
     ) -> bool,
     pub DiagGCStart: extern "C" fn(this: *mut IGCToCLR, gen: c_int, isInduced: bool),
     pub DiagUpdateGenerationBounds: extern "C" fn(this: *mut IGCToCLR),
-    pub DiagGCEnd: extern "C" fn(this: *mut IGCToCLR, index: usize, gen: c_int, reason: c_int, fConcurrent: bool),
-    pub DiagWalkFReachableObjects: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void),
-    pub DiagWalkSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, fCompacting: bool),
-    pub DiagWalkUOHSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, gen: c_int),
+    pub DiagGCEnd: extern "C" fn(
+        this: *mut IGCToCLR,
+        index: usize,
+        gen: c_int,
+        reason: c_int,
+        fConcurrent: bool,
+    ),
+    pub DiagWalkFReachableObjects:
+        extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void),
+    pub DiagWalkSurvivors:
+        extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, fCompacting: bool),
+    pub DiagWalkUOHSurvivors:
+        extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void, gen: c_int),
     pub DiagWalkBGCSurvivors: extern "C" fn(this: *mut IGCToCLR, gcContext: *mut std::ffi::c_void),
     pub StompWriteBarrier: extern "C" fn(this: *mut IGCToCLR, args: *const WriteBarrierParameters),
     pub EnableFinalization: extern "C" fn(this: *mut IGCToCLR, gcHasWorkForFinalizerThread: bool),
@@ -92,8 +107,12 @@ pub struct IGCToCLRVTable {
     pub FreeStringConfigValue: extern "C" fn(this: *mut IGCToCLR, value: *const c_char),
     pub IsGCThread: extern "C" fn(this: *mut IGCToCLR) -> bool,
     pub WasCurrentThreadCreatedByGC: extern "C" fn(this: *mut IGCToCLR) -> bool,
-    pub WalkAsyncPinnedForPromotion:
-        extern "C" fn(this: *mut IGCToCLR, object: *mut Object, sc: *mut ScanContext, callback: promote_func),
+    pub WalkAsyncPinnedForPromotion: extern "C" fn(
+        this: *mut IGCToCLR,
+        object: *mut Object,
+        sc: *mut ScanContext,
+        callback: promote_func,
+    ),
     pub WalkAsyncPinned: extern "C" fn(
         this: *mut IGCToCLR,
         object: *mut Object,
@@ -102,7 +121,8 @@ pub struct IGCToCLRVTable {
     ),
     pub EventSink: extern "C" fn(this: *mut IGCToCLR) -> *mut IGCToCLREventSink,
     pub GetTotalNumSizedRefHandles: extern "C" fn(this: *mut IGCToCLR) -> u32,
-    pub AnalyzeSurvivorsRequested: extern "C" fn(this: *mut IGCToCLR, condemnedGeneration: c_int) -> bool,
+    pub AnalyzeSurvivorsRequested:
+        extern "C" fn(this: *mut IGCToCLR, condemnedGeneration: c_int) -> bool,
     pub AnalyzeSurvivorsFinished: extern "C" fn(
         this: *mut IGCToCLR,
         gcIndex: usize,
@@ -111,13 +131,27 @@ pub struct IGCToCLRVTable {
         reportGenerationBounds: extern "C" fn(),
     ),
     pub VerifySyncTableEntry: extern "C" fn(this: *mut IGCToCLR),
-    pub UpdateGCEventStatus: extern "C" fn(this: *mut IGCToCLR, publicLevel: c_int, publicKeywords: c_int, privateLEvel: c_int, privateKeywords: c_int),
-    pub LogStressMsg: extern "C" fn(this: *mut IGCToCLR, level: u32, facility: u32, msg: *const StressLogMsg),
+    pub UpdateGCEventStatus: extern "C" fn(
+        this: *mut IGCToCLR,
+        publicLevel: c_int,
+        publicKeywords: c_int,
+        privateLEvel: c_int,
+        privateKeywords: c_int,
+    ),
+    pub LogStressMsg:
+        extern "C" fn(this: *mut IGCToCLR, level: u32, facility: u32, msg: *const StressLogMsg),
     pub GetCurrentProcessCpuCount: extern "C" fn(this: *mut IGCToCLR) -> u32,
-    pub DiagAddNewRegion: extern "C" fn(this: *mut IGCToCLR, generation: c_int, rangeStart: *mut u8, rangeEnd: *mut u8, rangeEndReserved: *mut u8),
+    pub DiagAddNewRegion: extern "C" fn(
+        this: *mut IGCToCLR,
+        generation: c_int,
+        rangeStart: *mut u8,
+        rangeEnd: *mut u8,
+        rangeEndReserved: *mut u8,
+    ),
     pub LogErrorToHost: extern "C" fn(this: *mut IGCToCLR, message: *const c_char),
     pub GetThreadOSThreadId: extern "C" fn(this: *mut IGCToCLR, thread: *mut Thread) -> u64,
-    pub TriggerClientBridgeProcessing: extern "C" fn(this: *mut IGCToCLR, args: *mut MarkCrossReferencesArgs),
+    pub TriggerClientBridgeProcessing:
+        extern "C" fn(this: *mut IGCToCLR, args: *mut MarkCrossReferencesArgs),
 }
 
 pub enum MethodTable {}
@@ -131,8 +165,8 @@ impl IGCToCLR {
         let mut val = false;
         let success = ((*self.vtable).GetBooleanConfigValue)(
             self as *const _ as *mut _,
-            name.as_ptr(),
-            public_name.as_ptr(),
+            name.as_ptr() as *const c_char,
+            public_name.as_ptr() as *const c_char,
             &mut val,
         );
         if success {
@@ -180,15 +214,17 @@ pub extern "C" fn GC_Initialize(
         *gc_handle_manager = &mut (*heap_ptr).handle_manager.ffi;
         // Add verification logging
         log!("GC_Initialize: Set gc_heap to {:p}", *gc_heap);
-        log!("GC_Initialize: Set gc_handle_manager to {:p}", *gc_handle_manager);
-        
+        log!(
+            "GC_Initialize: Set gc_handle_manager to {:p}",
+            *gc_handle_manager
+        );
+
         let dac = &mut *dac_vars;
-        
+
         log!("GC_Initialize: Set dac to {:?}", dac.generation_size);
         log!("GC_Initialize: Set dac to {:?}", dac.major_version_number);
         log!("GC_Initialize: Set dac to {:?}", dac.minor_version_number);
         log!("GC_Initialize: Set dac to {:?}", dac.total_generation_count);
-
 
         // Verify the vtable is accessible
         let heap_vtable = (*(*gc_heap)).vtable;
